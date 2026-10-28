@@ -744,6 +744,37 @@ app.get('/trigger', async (req, res) => {
   runRegistration();
 });
 
+// diagnostic endpoint
+app.get('/diag', async (req, res) => {
+  const id = req.query.id || '520';
+  const results = {};
+  for (const s of (activeCreds.servers || [])) {
+    try {
+      const u = `${s}/live/${activeCreds.username}/${activeCreds.password}/${id}.ts`;
+      const parsed = new URL(u);
+      const cl = parsed.protocol === 'https:' ? https : http;
+      const r = await new Promise(resolve => {
+        const q = cl.request({
+          hostname: parsed.hostname,
+          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+          path: parsed.pathname,
+          method: 'GET',
+          headers: { 'User-Agent': 'IPTVSmartersPlayer' }
+        }, resp => {
+          resolve({ status: resp.statusCode, location: resp.headers.location, server: resp.headers.server });
+        });
+        q.on('error', e => resolve({ error: e.message }));
+        q.setTimeout(5000, () => { q.destroy(); resolve({ error: 'timeout' }); });
+        q.end();
+      });
+      results[s] = r;
+    } catch (e) {
+      results[s] = { error: e.message };
+    }
+  }
+  res.json({ activeCreds, results });
+});
+
 // live logs endpoint
 app.get('/logs', (req, res) => {
   res.type('text/plain').send(runtimeLogs.join('\n'));
