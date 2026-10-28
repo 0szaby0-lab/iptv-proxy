@@ -28,6 +28,7 @@ console.error = (...args) => {
 };
 
 const fs = require('fs');
+const path = require('path');
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -481,6 +482,12 @@ async function doRegistration() {
               activeCreds.registeredAt = new Date().toISOString();
               foundCreds = true;
 
+              try {
+                fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2));
+              } catch (e) {
+                console.log(`[-] error saving creds to disk: ${e.message}`);
+              }
+
               console.log(`[+] ═══════════════════════════════════════`);
               console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
               console.log(`[+]   username: ${activeCreds.username}`);
@@ -523,6 +530,8 @@ function sleep(ms) {
 const PROXY_USER = process.env.PROXY_USER || 'myuser';
 const PROXY_PASS = process.env.PROXY_PASS || 'mypass';
 
+const CREDS_FILE = path.join(__dirname, 'active_creds.json');
+
 // active trial credentials — updated after each registration
 let activeCreds = {
   username: null,
@@ -531,6 +540,18 @@ let activeCreds = {
   portalUrl: null,    // full get.php URL
   registeredAt: null
 };
+
+try {
+  if (fs.existsSync(CREDS_FILE)) {
+    const saved = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf8'));
+    if (saved && saved.username && saved.password) {
+      activeCreds = saved;
+      console.log(`[+] loaded saved active credentials: ${activeCreds.username}`);
+    }
+  }
+} catch (e) {
+  console.log(`[-] error reading saved creds: ${e.message}`);
+}
 
 // ─── credential extraction from registration email ────────────────
 
@@ -623,51 +644,7 @@ function proxyRequest(upstreamUrl, req, res) {
   proxyReq.end();
 }
 
-function proxyStream(upstreamUrl, req, res, depth = 0) {
-  if (depth > 5) {
-    return res.status(502).send('too many stream redirects');
-  }
 
-  const parsed = new URL(upstreamUrl);
-  const client = parsed.protocol === 'https:' ? https : http;
-
-  const reqHeaders = {
-    'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPlayer',
-    'Accept': '*/*'
-  };
-
-  const proxyReq = client.request({
-    hostname: parsed.hostname,
-    port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-    path: parsed.pathname + parsed.search,
-    method: 'GET',
-    headers: reqHeaders
-  }, (proxyRes) => {
-    // If upstream returns a redirect (301, 302, 307, 308), follow it directly
-    // so the client receives 200 OK with the actual video stream over HTTPS
-    if ([301, 302, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
-      const redirectUrl = proxyRes.headers.location;
-      console.log(`[proxy] following stream redirect → ${redirectUrl}`);
-      return proxyStream(redirectUrl, req, res, depth + 1);
-    }
-
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-
-    req.on('close', () => {
-      proxyRes.destroy();
-    });
-  });
-
-  proxyReq.on('error', (err) => {
-    console.error(`[-] stream proxy error: ${err.message}`);
-    if (!res.headersSent) {
-      res.status(502).json({ error: 'upstream stream error', message: err.message });
-    }
-  });
-
-  proxyReq.end();
-}
 
 // ─── auth check ───────────────────────────────────────────────────
 
@@ -837,6 +814,9 @@ app.all('/player_api.php', async (req, res) => {
 
         data.user_info.username = PROXY_USER;
         data.user_info.password = PROXY_PASS;
+        data.user_info.auth = 1;
+        data.user_info.status = 'Active';
+        data.user_info.exp_date = '2145225600';
         data.server_info.url = hostOnly;
         data.server_info.port = portOnly;
         data.server_info.server_protocol = proxyProto;
@@ -868,55 +848,24 @@ app.all('/xmltv.php', (req, res) => {
   proxyRequest(upstreamUrl, req, res);
 });
 
-// GET /live/:user/:pass/* — live streams
-app.get('/live/:user/:pass/*', (req, res) => {
-  if (!isAuthed(req.params.user, req.params.pass)) {
-    return res.status(401).json({ error: 'invalid credentials' });
-  }
-  if (!activeCreds.username) {
-    return res.status(503).json({ error: 'no active trial' });
-  }
-
+// GET /:type(live|movie|series)/:user/:pass/* — media stream redirect (302)
+app.get('/:type(live|movie|series)/:user/:pass/*', (req, res) => {
+  const { type, user, pass } = req.params;
   const streamPath = req.params[0];
-  const server = getUpstreamServer();
-  const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${streamPath}`;
 
-  console.log(`[proxy] LIVE → ${streamPath}`);
-  proxyStream(upstreamUrl, req, res);
-});
-
-// GET /movie/:user/:pass/* — VOD
-app.get('/movie/:user/:pass/*', (req, res) => {
-  if (!isAuthed(req.params.user, req.params.pass)) {
+  if (!isAuthed(user, pass)) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
   if (!activeCreds.username) {
     return res.status(503).json({ error: 'no active trial' });
   }
 
-  const filePath = req.params[0];
   const server = getUpstreamServer();
-  const upstreamUrl = `${server}/movie/${activeCreds.username}/${activeCreds.password}/${filePath}`;
+  const finalStreamUrl = `${server}/${type}/${activeCreds.username}/${activeCreds.password}/${streamPath}`;
 
-  console.log(`[proxy] MOVIE → ${filePath}`);
-  proxyStream(upstreamUrl, req, res);
-});
-
-// GET /series/:user/:pass/* — series
-app.get('/series/:user/:pass/*', (req, res) => {
-  if (!isAuthed(req.params.user, req.params.pass)) {
-    return res.status(401).json({ error: 'invalid credentials' });
-  }
-  if (!activeCreds.username) {
-    return res.status(503).json({ error: 'no active trial' });
-  }
-
-  const filePath = req.params[0];
-  const server = getUpstreamServer();
-  const upstreamUrl = `${server}/series/${activeCreds.username}/${activeCreds.password}/${filePath}`;
-
-  console.log(`[proxy] SERIES → ${filePath}`);
-  proxyStream(upstreamUrl, req, res);
+  console.log(`[proxy] ${type.toUpperCase()} 302 → ${finalStreamUrl}`);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.redirect(302, finalStreamUrl);
 });
 
 // GET /:user/:pass/:stream — generic direct stream URL (without /live/ prefix)
@@ -930,10 +879,11 @@ app.get('/:user/:pass/:stream', (req, res, next) => {
   }
 
   const server = getUpstreamServer();
-  const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`;
+  const finalStreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`;
 
-  console.log(`[proxy] DIRECT STREAM → ${stream}`);
-  proxyStream(upstreamUrl, req, res);
+  console.log(`[proxy] DIRECT STREAM 302 → ${finalStreamUrl}`);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.redirect(302, finalStreamUrl);
 });
 
 // ─── registration runner ──────────────────────────────────────────
