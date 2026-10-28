@@ -27,8 +27,19 @@ console.error = (...args) => {
   origErr(...args);
 };
 
+const fs = require('fs');
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// log all incoming HTTP requests
+app.use((req, res, next) => {
+  if (req.path !== '/logs') {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.log(`[HTTP] ${req.method} ${req.originalUrl} from ${ip} (UA: ${req.headers['user-agent'] || 'none'})`);
+  }
+  next();
+});
 
 // ─── config ───────────────────────────────────────────────────────
 const TARGET_URL = 'https://iptvload.org/iptv-free-trial-4/';
@@ -644,14 +655,18 @@ function checkProxyAuth(req, res) {
 }
 
 function getUpstreamServer() {
+  const servers = activeCreds.servers || [];
+  const bcdn = servers.find(s => s.includes('business-cdn'));
+  if (bcdn) return bcdn;
   if (activeCreds.portalUrl) {
     try {
       const parsed = new URL(activeCreds.portalUrl);
       return `${parsed.protocol}//${parsed.host}`;
     } catch {}
   }
-  const preferred = (activeCreds.servers || []).find(s => s.includes('business-cdn') || s.includes('iptvload.link'));
-  return preferred || (activeCreds.servers && activeCreds.servers[0]) || 'http://tv.business-cdn-8k.com';
+  const link = servers.find(s => s.includes('iptvload.link'));
+  if (link) return link;
+  return servers[0] || 'http://tv.business-cdn-8k.com';
 }
 
 // ─── express server + IPTV proxy ──────────────────────────────────
