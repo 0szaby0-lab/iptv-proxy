@@ -1,0 +1,16 @@
+{
+  "name": "iptv-auto-register",
+  "version": "1.0.0",
+  "description": "Auto-register IPTV free trial every 20 hours",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "express": "^4.18.2"
+  }
+}
