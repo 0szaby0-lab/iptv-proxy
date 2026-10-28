@@ -541,20 +541,33 @@ function extractCredentials(bodyText) {
 
 // ─── proxy helper: pipe request to upstream IPTV server ───────────
 
+// CORS middleware
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// ─── proxy helper: pipe request to upstream IPTV server ───────────
+
 function proxyRequest(upstreamUrl, req, res) {
   const parsed = new URL(upstreamUrl);
   const client = parsed.protocol === 'https:' ? https : http;
+
+  const reqHeaders = {
+    'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPro/3.1.5',
+    'Accept': req.headers['accept'] || '*/*',
+    'Accept-Encoding': req.headers['accept-encoding'] || 'gzip, deflate'
+  };
 
   const proxyReq = client.request({
     hostname: parsed.hostname,
     port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
     path: parsed.pathname + parsed.search,
-    method: req.method,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      'Accept': '*/*',
-      'Accept-Encoding': 'identity' // no gzip — pipe raw
-    }
+    method: 'GET',
+    headers: reqHeaders
   }, (proxyRes) => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
@@ -572,11 +585,23 @@ function proxyRequest(upstreamUrl, req, res) {
 
 // ─── auth check ───────────────────────────────────────────────────
 
-function checkProxyAuth(req, res) {
-  const u = req.query.username;
-  const p = req.query.password;
+function getCredentials(req) {
+  const username = req.query.username || (req.body && req.body.username) || '';
+  const password = req.query.password || (req.body && req.body.password) || '';
+  const action = req.query.action || (req.body && req.body.action) || '';
+  return { username, password, action };
+}
 
-  if (u !== PROXY_USER || p !== PROXY_PASS) {
+function isAuthed(user, pass) {
+  const isCustom = (user === PROXY_USER && pass === PROXY_PASS);
+  const isTrial = activeCreds.username && (user === activeCreds.username && pass === activeCreds.password);
+  return isCustom || isTrial;
+}
+
+function checkProxyAuth(req, res) {
+  const { username, password } = getCredentials(req);
+
+  if (!isAuthed(username, password)) {
     res.status(401).json({ error: 'invalid credentials' });
     return false;
   }
@@ -590,7 +615,6 @@ function checkProxyAuth(req, res) {
 }
 
 function getUpstreamServer() {
-  // use first server as primary
   return activeCreds.servers[0];
 }
 
@@ -625,59 +649,102 @@ app.get('/trigger', async (req, res) => {
 
 // ─── Xtream Codes API proxy endpoints ─────────────────────────────
 
-// GET /get.php — M3U playlist
-app.get('/get.php', (req, res) => {
+// ALL /get.php — M3U playlist
+app.all('/get.php', (req, res) => {
   if (!checkProxyAuth(req, res)) return;
 
   const server = getUpstreamServer();
-  // build upstream URL with real credentials + original query params
-  const params = new URLSearchParams(req.query);
-  params.set('username', activeCreds.username);
-  params.set('password', activeCreds.password);
-  const upstreamUrl = `${server}/get.php?${params.toString()}`;
+  const allParams = { ...(req.query || {}), ...(req.body || {}) };
+  allParams.username = activeCreds.username;
+  allParams.password = activeCreds.password;
+  const searchParams = new URLSearchParams(allParams);
+  const upstreamUrl = `${server}/get.php?${searchParams.toString()}`;
 
-  console.log(`[proxy] GET /get.php → ${server}`);
+  console.log(`[proxy] ${req.method} /get.php → ${server}`);
   proxyRequest(upstreamUrl, req, res);
 });
 
-// GET /player_api.php — Xtream Codes API
-app.get('/player_api.php', (req, res) => {
+// ALL /player_api.php — Xtream Codes API (handles both GET and POST)
+app.all('/player_api.php', async (req, res) => {
+  if (!checkProxyAuth(req, res)) return;
+
+  const { action } = getCredentials(req);
+  const server = getUpstreamServer();
+
+  const allParams = { ...(req.body || {}), ...(req.query || {}) };
+  allParams.username = activeCreds.username;
+  allParams.password = activeCreds.password;
+
+  const searchParams = new URLSearchParams();
+  for (const [k, v] of Object.entries(allParams)) {
+    if (v !== undefined && v !== null) {
+      searchParams.set(k, String(v));
+    }
+  }
+
+  const upstreamUrl = `${server}/player_api.php?${searchParams.toString()}`;
+  console.log(`[proxy] ${req.method} /player_api.php?action=${action || 'auth'} → ${server}`);
+
+  // Auth / handshake request: rewrite user_info and server_info
+  // so IPTV Smarters Pro saves our proxy domain & user/pass
+  if (!action) {
+    try {
+      const resp = await fetch(upstreamUrl, {
+        headers: {
+          'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPro/3.1.5',
+          'Accept': 'application/json'
+        }
+      });
+      const data = await resp.json();
+      if (data && data.user_info && data.server_info) {
+        const proxyHost = req.get('x-forwarded-host') || req.get('host') || 'localhost';
+        const proxyProto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
+        const hostOnly = proxyHost.split(':')[0];
+        const portOnly = proxyHost.split(':')[1] || (proxyProto === 'https' ? '443' : '80');
+
+        data.user_info.username = PROXY_USER;
+        data.user_info.password = PROXY_PASS;
+        data.server_info.url = hostOnly;
+        data.server_info.port = portOnly;
+        data.server_info.server_protocol = proxyProto;
+        data.server_info.https_port = '443';
+      }
+      return res.json(data);
+    } catch (e) {
+      console.error(`[-] auth rewrite fallback: ${e.message}`);
+      return proxyRequest(upstreamUrl, req, res);
+    }
+  }
+
+  // All other actions (categories, streams, epg)
+  proxyRequest(upstreamUrl, req, res);
+});
+
+// ALL /xmltv.php — EPG data
+app.all('/xmltv.php', (req, res) => {
   if (!checkProxyAuth(req, res)) return;
 
   const server = getUpstreamServer();
-  const params = new URLSearchParams(req.query);
-  params.set('username', activeCreds.username);
-  params.set('password', activeCreds.password);
-  const upstreamUrl = `${server}/player_api.php?${params.toString()}`;
+  const allParams = { ...(req.query || {}), ...(req.body || {}) };
+  allParams.username = activeCreds.username;
+  allParams.password = activeCreds.password;
+  const searchParams = new URLSearchParams(allParams);
+  const upstreamUrl = `${server}/xmltv.php?${searchParams.toString()}`;
 
-  console.log(`[proxy] GET /player_api.php?action=${req.query.action || 'auth'} → ${server}`);
+  console.log(`[proxy] ${req.method} /xmltv.php → ${server}`);
   proxyRequest(upstreamUrl, req, res);
 });
 
-// GET /xmltv.php — EPG data
-app.get('/xmltv.php', (req, res) => {
-  if (!checkProxyAuth(req, res)) return;
-
-  const server = getUpstreamServer();
-  const params = new URLSearchParams(req.query);
-  params.set('username', activeCreds.username);
-  params.set('password', activeCreds.password);
-  const upstreamUrl = `${server}/xmltv.php?${params.toString()}`;
-
-  console.log(`[proxy] GET /xmltv.php → ${server}`);
-  proxyRequest(upstreamUrl, req, res);
-});
-
-// GET /live/:username/:password/:stream — live streams
+// GET /live/:user/:pass/* — live streams
 app.get('/live/:user/:pass/*', (req, res) => {
-  if (req.params.user !== PROXY_USER || req.params.pass !== PROXY_PASS) {
+  if (!isAuthed(req.params.user, req.params.pass)) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
   if (!activeCreds.username) {
     return res.status(503).json({ error: 'no active trial' });
   }
 
-  const streamPath = req.params[0]; // everything after /live/user/pass/
+  const streamPath = req.params[0];
   const server = getUpstreamServer();
   const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${streamPath}`;
 
@@ -685,9 +752,9 @@ app.get('/live/:user/:pass/*', (req, res) => {
   proxyRequest(upstreamUrl, req, res);
 });
 
-// GET /movie/:username/:password/:file — VOD
+// GET /movie/:user/:pass/* — VOD
 app.get('/movie/:user/:pass/*', (req, res) => {
-  if (req.params.user !== PROXY_USER || req.params.pass !== PROXY_PASS) {
+  if (!isAuthed(req.params.user, req.params.pass)) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
   if (!activeCreds.username) {
@@ -702,9 +769,9 @@ app.get('/movie/:user/:pass/*', (req, res) => {
   proxyRequest(upstreamUrl, req, res);
 });
 
-// GET /series/:username/:password/:file — series
+// GET /series/:user/:pass/* — series
 app.get('/series/:user/:pass/*', (req, res) => {
-  if (req.params.user !== PROXY_USER || req.params.pass !== PROXY_PASS) {
+  if (!isAuthed(req.params.user, req.params.pass)) {
     return res.status(401).json({ error: 'invalid credentials' });
   }
   if (!activeCreds.username) {
@@ -716,6 +783,23 @@ app.get('/series/:user/:pass/*', (req, res) => {
   const upstreamUrl = `${server}/series/${activeCreds.username}/${activeCreds.password}/${filePath}`;
 
   console.log(`[proxy] SERIES → ${filePath}`);
+  proxyRequest(upstreamUrl, req, res);
+});
+
+// GET /:user/:pass/:stream — generic direct stream URL (without /live/ prefix)
+app.get('/:user/:pass/:stream', (req, res, next) => {
+  const { user, pass, stream } = req.params;
+  if (!isAuthed(user, pass)) {
+    return next();
+  }
+  if (!activeCreds.username) {
+    return res.status(503).json({ error: 'no active trial' });
+  }
+
+  const server = getUpstreamServer();
+  const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`;
+
+  console.log(`[proxy] DIRECT STREAM → ${stream}`);
   proxyRequest(upstreamUrl, req, res);
 });
 
