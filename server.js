@@ -623,6 +623,52 @@ function proxyRequest(upstreamUrl, req, res) {
   proxyReq.end();
 }
 
+function proxyStream(upstreamUrl, req, res, depth = 0) {
+  if (depth > 5) {
+    return res.status(502).send('too many stream redirects');
+  }
+
+  const parsed = new URL(upstreamUrl);
+  const client = parsed.protocol === 'https:' ? https : http;
+
+  const reqHeaders = {
+    'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPlayer',
+    'Accept': '*/*'
+  };
+
+  const proxyReq = client.request({
+    hostname: parsed.hostname,
+    port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+    path: parsed.pathname + parsed.search,
+    method: 'GET',
+    headers: reqHeaders
+  }, (proxyRes) => {
+    // If upstream returns a redirect (301, 302, 307, 308), follow it directly
+    // so the client receives 200 OK with the actual video stream over HTTPS
+    if ([301, 302, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+      const redirectUrl = proxyRes.headers.location;
+      console.log(`[proxy] following stream redirect → ${redirectUrl}`);
+      return proxyStream(redirectUrl, req, res, depth + 1);
+    }
+
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+
+    req.on('close', () => {
+      proxyRes.destroy();
+    });
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[-] stream proxy error: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'upstream stream error', message: err.message });
+    }
+  });
+
+  proxyReq.end();
+}
+
 // ─── auth check ───────────────────────────────────────────────────
 
 function getCredentials(req) {
@@ -805,7 +851,7 @@ app.get('/live/:user/:pass/*', (req, res) => {
   const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${streamPath}`;
 
   console.log(`[proxy] LIVE → ${streamPath}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyStream(upstreamUrl, req, res);
 });
 
 // GET /movie/:user/:pass/* — VOD
@@ -822,7 +868,7 @@ app.get('/movie/:user/:pass/*', (req, res) => {
   const upstreamUrl = `${server}/movie/${activeCreds.username}/${activeCreds.password}/${filePath}`;
 
   console.log(`[proxy] MOVIE → ${filePath}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyStream(upstreamUrl, req, res);
 });
 
 // GET /series/:user/:pass/* — series
@@ -839,7 +885,7 @@ app.get('/series/:user/:pass/*', (req, res) => {
   const upstreamUrl = `${server}/series/${activeCreds.username}/${activeCreds.password}/${filePath}`;
 
   console.log(`[proxy] SERIES → ${filePath}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyStream(upstreamUrl, req, res);
 });
 
 // GET /:user/:pass/:stream — generic direct stream URL (without /live/ prefix)
@@ -856,7 +902,7 @@ app.get('/:user/:pass/:stream', (req, res, next) => {
   const upstreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`;
 
   console.log(`[proxy] DIRECT STREAM → ${stream}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyStream(upstreamUrl, req, res);
 });
 
 // ─── registration runner ──────────────────────────────────────────
