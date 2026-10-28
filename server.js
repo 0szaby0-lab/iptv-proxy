@@ -10,6 +10,23 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// in-memory log buffer for /logs endpoint
+const runtimeLogs = [];
+const origLog = console.log;
+const origErr = console.error;
+console.log = (...args) => {
+  const line = `[${new Date().toISOString()}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}`;
+  runtimeLogs.push(line);
+  if (runtimeLogs.length > 500) runtimeLogs.shift();
+  origLog(...args);
+};
+console.error = (...args) => {
+  const line = `[${new Date().toISOString()}] [ERR] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}`;
+  runtimeLogs.push(line);
+  if (runtimeLogs.length > 500) runtimeLogs.shift();
+  origErr(...args);
+};
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -428,47 +445,56 @@ async function doRegistration() {
       }
     }
 
-    // 6. check email for IPTV credentials
+    // 6. check email for IPTV credentials (poll up to 4 minutes)
     if (success) {
-      console.log(`[*] waiting 90s for IPTV credentials email...`);
-      await sleep(90000);
-      const messages = await checkInbox(mailAccount);
-      if (messages.length > 0) {
-        console.log(`[+] received ${messages.length} email(s)!`);
-        for (const msg of messages) {
-          if (msg.subject && msg.subject.includes('Welcome to Guerrilla')) continue;
-          if (msg.subject && msg.subject.includes('verification code')) continue;
-          const full = await readMessage(mailAccount, msg.id);
-          console.log(`    from: ${full.from || 'unknown'} | subject: ${full.subject}`);
-          const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
+      console.log(`[*] waiting for IPTV credentials email (polling up to 4 minutes)...`);
+      let foundCreds = false;
+      for (let attempt = 1; attempt <= 16; attempt++) {
+        await sleep(15000);
+        const messages = await checkInbox(mailAccount);
+        if (messages && messages.length > 0) {
+          for (const msg of messages) {
+            if (msg.subject && msg.subject.includes('Welcome to Guerrilla')) continue;
+            if (msg.subject && msg.subject.includes('verification code')) continue;
+            const full = await readMessage(mailAccount, msg.id);
+            console.log(`[+] candidate email from: ${full.from || 'unknown'} | subject: ${full.subject}`);
+            const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
 
-          // extract and store IPTV credentials for the proxy
-          const creds = extractCredentials(bodyText);
-          if (creds.username && creds.password) {
-            activeCreds.username = creds.username;
-            activeCreds.password = creds.password;
-            activeCreds.portalUrl = creds.portalUrl || null;
-            activeCreds.servers = creds.servers || [];
-            activeCreds.registeredAt = new Date().toISOString();
+            // extract and store IPTV credentials for the proxy
+            const creds = extractCredentials(bodyText);
+            if (creds.username && creds.password) {
+              activeCreds.username = creds.username;
+              activeCreds.password = creds.password;
+              activeCreds.portalUrl = creds.portalUrl || null;
+              activeCreds.servers = creds.servers || [];
+              activeCreds.registeredAt = new Date().toISOString();
+              foundCreds = true;
 
-            console.log(`[+] ═══════════════════════════════════════`);
-            console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
-            console.log(`[+]   username: ${activeCreds.username}`);
-            console.log(`[+]   password: ${activeCreds.password}`);
-            console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
-            console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
-            console.log(`[+] ═══════════════════════════════════════`);
+              console.log(`[+] ═══════════════════════════════════════`);
+              console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
+              console.log(`[+]   username: ${activeCreds.username}`);
+              console.log(`[+]   password: ${activeCreds.password}`);
+              console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
+              console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
+              console.log(`[+] ═══════════════════════════════════════`);
+              break;
+            } else {
+              console.log(`[*] email body snippet: ${bodyText.substring(0, 300)}`);
+            }
           }
-
-          console.log(`[*] email body: ${bodyText.substring(0, 500)}`);
         }
-      } else {
-        console.log(`[*] no credential emails yet`);
+        if (foundCreds) break;
+        console.log(`[*] poll attempt ${attempt}/16: credentials not arrived yet...`);
+      }
+
+      if (!foundCreds) {
+        console.log(`[-] credentials email did not arrive within 4 minutes`);
       }
     }
 
-    console.log(`[${new Date().toISOString()}] registration cycle complete (${success ? 'SUCCESS' : 'FAILED'})`);
-    return success;
+    const overallSuccess = success && !!activeCreds.username;
+    console.log(`[${new Date().toISOString()}] registration cycle complete (${overallSuccess ? 'SUCCESS' : 'FAILED - NO CREDS'})`);
+    return overallSuccess;
 
   } catch (err) {
     console.error(`[-] registration error: ${err.message}`);
@@ -655,6 +681,11 @@ app.get('/', (req, res) => {
 app.get('/trigger', async (req, res) => {
   res.json({ message: 'registration triggered manually' });
   runRegistration();
+});
+
+// live logs endpoint
+app.get('/logs', (req, res) => {
+  res.type('text/plain').send(runtimeLogs.join('\n'));
 });
 
 // ─── Xtream Codes API proxy endpoints ─────────────────────────────
