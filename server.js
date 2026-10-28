@@ -10,6 +10,9 @@ const { URL } = require('url');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
 // ─── config ───────────────────────────────────────────────────────
 const TARGET_URL = 'https://iptvload.org/iptv-free-trial-4/';
 const REGISTER_INTERVAL_HOURS = 20;
