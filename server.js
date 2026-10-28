@@ -618,7 +618,14 @@ function checkProxyAuth(req, res) {
 }
 
 function getUpstreamServer() {
-  return activeCreds.servers[0];
+  if (activeCreds.portalUrl) {
+    try {
+      const parsed = new URL(activeCreds.portalUrl);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {}
+  }
+  const preferred = (activeCreds.servers || []).find(s => s.includes('business-cdn') || s.includes('iptvload.link'));
+  return preferred || (activeCreds.servers && activeCreds.servers[0]) || 'http://tv.business-cdn-8k.com';
 }
 
 // ─── express server + IPTV proxy ──────────────────────────────────
