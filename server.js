@@ -1,11 +1,15 @@
 // Node.js — IPTV auto-registration service for render.com
-// submits WPForms free trial form every 20 hours with a fresh temp email
+// submits WPForms free trial form every 20 hours with a fresh SimpleLogin alias + Gmail IMAP
 
 const express = require('express');
 const cron = require('node-cron');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+const fs = require('fs');
+const path = require('path');
+const { ImapFlow } = require('imapflow');
+const { simpleParser } = require('mailparser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,9 +31,6 @@ console.error = (...args) => {
   origErr(...args);
 };
 
-const fs = require('fs');
-const path = require('path');
-
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -46,8 +47,20 @@ app.use((req, res, next) => {
 const TARGET_URL = 'https://iptvload.org/iptv-free-trial-4/';
 const REGISTER_INTERVAL_HOURS = 20;
 
-// temp mail API — mail.tm (REST API, creates real accounts)
-const MAIL_TM_API = 'https://api.mail.tm';
+// SimpleLogin & Gmail IMAP configuration
+const SIMPLELOGIN_API = 'https://app.simplelogin.io';
+const SIMPLELOGIN_API_KEY = process.env.SIMPLELOGIN_API_KEY || 'trrjhzhkhluxvtjqrhyekcrarkkpnkvmwevebqwjqookjswnqiagaaizaghf';
+
+const IMAP_CONFIG = {
+  host: process.env.IMAP_HOST || 'imap.gmail.com',
+  port: 993,
+  secure: true,
+  auth: {
+    user: process.env.IMAP_USER || 'allotoi5@gmail.com',
+    pass: process.env.IMAP_PASS || 'bemtvhhbgilwhsqm'
+  },
+  logger: false
+};
 
 // random data pools
 const FIRST_NAMES = [
@@ -91,18 +104,8 @@ function randInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-function generateUsername() {
-  const first = pick(FIRST_NAMES).toLowerCase();
-  const last = pick(LAST_NAMES).toLowerCase();
-  const num = randInt(10, 9999);
-  const patterns = [
-    `${first}.${last}${num}`,
-    `${first}${last}${num}`,
-    `${first}_${last}${randInt(1, 99)}`,
-    `${first}${randInt(100, 999)}`,
-    `${last}.${first}${randInt(1, 99)}`
-  ];
-  return pick(patterns);
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function httpRequest(url, options = {}) {
@@ -137,122 +140,154 @@ function httpRequest(url, options = {}) {
   });
 }
 
-// ─── temp email (multi-provider: mail.tm primary, guerrilla fallback) ──
+// ─── temp email (SimpleLogin API + Gmail IMAP) ───────────────────
 
-const GUERRILLA_API = 'https://api.guerrillamail.com/ajax.php';
-
-async function getMailTmDomain() {
-  const res = await httpRequest(`${MAIL_TM_API}/domains`);
-  if (res.status !== 200) throw new Error(`mail.tm domains: ${res.status}`);
-  const data = JSON.parse(res.body);
-  const domains = data['hydra:member'].filter(d => d.isActive);
-  if (domains.length === 0) throw new Error('no active mail.tm domains');
-  return pick(domains).domain;
-}
-
-async function tryMailTm() {
-  const domain = await getMailTmDomain();
-  const username = generateUsername();
-  const address = `${username}@${domain}`;
-  const password = `Pass${randInt(100000, 999999)}!`;
-
-  const createRes = await httpRequest(`${MAIL_TM_API}/accounts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ address, password })
-  });
-
-  if (createRes.status !== 201) {
-    throw new Error(`mail.tm create: ${createRes.status} ${createRes.body.substring(0, 100)}`);
+async function cleanupOldSimpleLoginAliases() {
+  try {
+    const res = await httpRequest(`${SIMPLELOGIN_API}/api/v2/aliases?page_id=0`, {
+      method: 'GET',
+      headers: { 'Authentication': SIMPLELOGIN_API_KEY }
+    });
+    if (res.status === 200) {
+      const data = JSON.parse(res.body);
+      const aliases = data.aliases || [];
+      // If free tier limit (10) is close or full, purge oldest aliases
+      if (aliases.length >= 9) {
+        console.log(`[*] SimpleLogin alias count at ${aliases.length}, cleaning up old aliases...`);
+        for (const a of aliases.slice(-3)) {
+          await httpRequest(`${SIMPLELOGIN_API}/api/aliases/${a.id}`, {
+            method: 'DELETE',
+            headers: { 'Authentication': SIMPLELOGIN_API_KEY }
+          });
+          console.log(`[+] deleted old alias: ${a.email} (ID: ${a.id})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`[-] alias cleanup check warning: ${err.message}`);
   }
-
-  const tokenRes = await httpRequest(`${MAIL_TM_API}/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ address, password })
-  });
-
-  if (tokenRes.status !== 200) {
-    throw new Error(`mail.tm token: ${tokenRes.status}`);
-  }
-
-  const tokenData = JSON.parse(tokenRes.body);
-  return { provider: 'mailtm', address, token: tokenData.token };
-}
-
-async function tryGuerrilla() {
-  // get a session + email address
-  const res = await httpRequest(`${GUERRILLA_API}?f=get_email_address&lang=en`);
-  if (res.status !== 200) throw new Error(`guerrilla: ${res.status}`);
-  const data = JSON.parse(res.body);
-
-  // try to set a custom username for a less-suspicious look
-  const username = generateUsername();
-  const setRes = await httpRequest(`${GUERRILLA_API}?f=set_email_user&email_user=${encodeURIComponent(username)}&lang=en&sid_token=${data.sid_token}`);
-  const setData = JSON.parse(setRes.body);
-
-  return {
-    provider: 'guerrilla',
-    address: setData.email_addr || data.email_addr,
-    sid_token: data.sid_token
-  };
 }
 
 async function createTempMailAccount() {
-  // try mail.tm with retries first (better domains)
+  await cleanupOldSimpleLoginAliases();
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      console.log(`[*] mail.tm attempt ${attempt}/3...`);
-      const account = await tryMailTm();
-      console.log(`[+] mail.tm success: ${account.address}`);
-      return account;
+      console.log(`[*] SimpleLogin alias attempt ${attempt}/3...`);
+      const res = await httpRequest(`${SIMPLELOGIN_API}/api/v1/alias/random/new`, {
+        method: 'POST',
+        headers: {
+          'Authentication': SIMPLELOGIN_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (res.status !== 201 && res.status !== 200) {
+        throw new Error(`SimpleLogin HTTP ${res.status}: ${res.body.substring(0, 150)}`);
+      }
+
+      const data = JSON.parse(res.body);
+      console.log(`[+] SimpleLogin success: ${data.alias} (ID: ${data.id})`);
+
+      return {
+        provider: 'simplelogin',
+        address: data.alias,
+        aliasId: data.id,
+        createdAt: new Date(Date.now() - 120000)
+      };
     } catch (err) {
-      console.log(`[-] mail.tm attempt ${attempt} failed: ${err.message}`);
-      if (attempt < 3) await sleep(2000 * attempt); // exponential backoff
+      console.log(`[-] SimpleLogin attempt ${attempt} failed: ${err.message}`);
+      if (attempt < 3) await sleep(3000 * attempt);
     }
   }
+  throw new Error('Failed to create SimpleLogin alias after 3 attempts');
+}
 
-  // fallback to guerrilla mail
-  console.log(`[*] falling back to guerrilla mail...`);
+async function deleteTempMailAccount(account) {
+  if (!account || !account.aliasId) return;
   try {
-    const account = await tryGuerrilla();
-    console.log(`[+] guerrilla mail: ${account.address}`);
-    return account;
+    const res = await httpRequest(`${SIMPLELOGIN_API}/api/aliases/${account.aliasId}`, {
+      method: 'DELETE',
+      headers: {
+        'Authentication': SIMPLELOGIN_API_KEY
+      }
+    });
+    if (res.status === 200) {
+      console.log(`[+] SimpleLogin alias deleted: ${account.address} (ID: ${account.aliasId})`);
+    } else {
+      console.log(`[-] SimpleLogin delete status ${res.status}: ${res.body}`);
+    }
   } catch (err) {
-    throw new Error(`all temp mail providers failed. last error: ${err.message}`);
+    console.log(`[-] SimpleLogin delete error: ${err.message}`);
   }
 }
 
 async function checkInbox(account) {
-  if (account.provider === 'mailtm') {
-    const res = await httpRequest(`${MAIL_TM_API}/messages`, {
-      headers: { 'Authorization': `Bearer ${account.token}` }
-    });
-    const data = JSON.parse(res.body);
-    return (data['hydra:member'] || []).map(m => ({ id: m.id, from: m.from?.address, subject: m.subject }));
-  } else {
-    // guerrilla
-    const res = await httpRequest(`${GUERRILLA_API}?f=check_email&sid_token=${account.sid_token}&seq=0`);
-    const data = JSON.parse(res.body);
-    return (data.list || []).map(m => ({ id: m.mail_id, from: m.mail_from, subject: m.mail_subject }));
+  const client = new ImapFlow(IMAP_CONFIG);
+  const messages = [];
+
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const uids = await client.search({ since: account.createdAt }, { uid: true });
+
+      if (uids && uids.length > 0) {
+        for await (const msg of client.fetch(uids, { uid: true, envelope: true })) {
+          const toList = (msg.envelope.to || []).map(t => (t.address || '').toLowerCase());
+          const subject = msg.envelope.subject || '';
+          const from = msg.envelope.from?.[0]?.address || '';
+
+          const targetAlias = account.address.toLowerCase();
+          const mainInbox = IMAP_CONFIG.auth.user.toLowerCase();
+
+          if (toList.includes(targetAlias) || toList.includes(mainInbox) || toList.length === 0) {
+            messages.push({
+              id: msg.uid,
+              from: from,
+              subject: subject
+            });
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+  } catch (err) {
+    console.log(`[-] IMAP checkInbox error: ${err.message}`);
   }
+
+  return messages.reverse();
 }
 
-async function readMessage(account, msgId) {
-  if (account.provider === 'mailtm') {
-    const res = await httpRequest(`${MAIL_TM_API}/messages/${msgId}`, {
-      headers: { 'Authorization': `Bearer ${account.token}` }
-    });
-    const data = JSON.parse(res.body);
-    return { from: data.from?.address, subject: data.subject, body: data.text || data.html || '' };
-  } else {
-    const res = await httpRequest(`${GUERRILLA_API}?f=fetch_email&sid_token=${account.sid_token}&email_id=${msgId}`);
-    const data = JSON.parse(res.body);
-    return { from: data.mail_from, subject: data.mail_subject, body: data.mail_body || '' };
-  }
-}
+async function readMessage(account, msgUid) {
+  const client = new ImapFlow(IMAP_CONFIG);
+  let result = { from: '', subject: '', body: '' };
 
-// ─── WPForms extraction & submission ─────────────────────────────
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const msg = await client.fetchOne(String(msgUid), { source: true }, { uid: true });
+      if (msg && msg.source) {
+        const parsed = await simpleParser(msg.source);
+        result = {
+          from: parsed.from?.text || '',
+          subject: parsed.subject || '',
+          body: parsed.text || parsed.html || ''
+        };
+      }
+    } finally {
+      lock.release();
+    }
+    await client.logout();
+  } catch (err) {
+    console.log(`[-] IMAP readMessage error: ${err.message}`);
+  }
+
+  return result;
+}
 
 // ─── WPForms submission (hardcoded field IDs from page inspection) ──
 // form ID: 1019 | page ID: 1321
@@ -267,9 +302,11 @@ async function doRegistration() {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`[${timestamp}] starting registration...`);
 
+  let mailAccount = null;
+
   try {
-    // 1. generate fresh temp email
-    const mailAccount = await createTempMailAccount();
+    // 1. generate fresh SimpleLogin alias
+    mailAccount = await createTempMailAccount();
     const email = mailAccount.address;
     const firstName = pick(FIRST_NAMES);
     const lastName = pick(LAST_NAMES);
@@ -335,9 +372,6 @@ async function doRegistration() {
       try {
         const messages = await checkInbox(mailAccount);
         for (const msg of messages) {
-          // skip guerrilla welcome emails
-          if (msg.subject && msg.subject.includes('Welcome to Guerrilla')) continue;
-
           const full = await readMessage(mailAccount, msg.id);
           const bodyText = full.body || '';
           console.log(`[*] email from: ${full.from} | subject: ${full.subject}`);
@@ -414,7 +448,6 @@ async function doRegistration() {
     bodyParams.append('page_url', TARGET_URL);
     bodyParams.append('page_id', '1321');
     bodyParams.append('action', 'wpforms_submit');
-    // email verification token
     bodyParams.append('ivl_token', ivlToken);
 
     console.log(`[*] submitting form with verified email...`);
@@ -466,8 +499,7 @@ async function doRegistration() {
         const messages = await checkInbox(mailAccount);
         if (messages && messages.length > 0) {
           for (const msg of messages) {
-            if (msg.subject && msg.subject.includes('Welcome to Guerrilla')) continue;
-            if (msg.subject && msg.subject.includes('verification code')) continue;
+            if (msg.subject && msg.subject.toLowerCase().includes('verification code')) continue;
             const full = await readMessage(mailAccount, msg.id);
             console.log(`[+] candidate email from: ${full.from || 'unknown'} | subject: ${full.subject}`);
             const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
@@ -518,11 +550,11 @@ async function doRegistration() {
     console.error(`[-] registration error: ${err.message}`);
     console.error(err.stack);
     return false;
+  } finally {
+    if (mailAccount) {
+      await deleteTempMailAccount(mailAccount);
+    }
   }
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ─── IPTV proxy config ────────────────────────────────────────────
@@ -559,11 +591,11 @@ function extractCredentials(bodyText) {
   const creds = {};
 
   // username
-  const userMatch = bodyText.match(/USERNAME\s+(\S+)/i);
+  const userMatch = bodyText.match(/USERNAME\s*:?\s*(\S+)/i);
   if (userMatch) creds.username = userMatch[1];
 
   // password
-  const passMatch = bodyText.match(/PASSWORD\s+(\S+)/i);
+  const passMatch = bodyText.match(/PASSWORD\s*:?\s*(\S+)/i);
   if (passMatch) creds.password = passMatch[1];
 
   // portal URL (get.php)
@@ -576,8 +608,7 @@ function extractCredentials(bodyText) {
   let m;
   while ((m = serverPattern.exec(bodyText)) !== null) {
     const url = m[1].replace(/\/$/, '');
-    // skip iptvload.org itself and obvious non-server URLs
-    if (!url.includes('iptvload.org') && !url.includes('get.php') && !servers.includes(url)) {
+    if (!url.includes('iptvload.org') && !url.includes('simplelogin') && !url.includes('get.php') && !servers.includes(url)) {
       servers.push(url);
     }
   }
@@ -591,7 +622,6 @@ function extractCredentials(bodyText) {
       if (!creds.servers) creds.servers = [];
       if (!creds.servers.includes(baseServer)) creds.servers.unshift(baseServer);
 
-      // extract username/password from URL params if not found in text
       if (!creds.username) creds.username = parsed.searchParams.get('username');
       if (!creds.password) creds.password = parsed.searchParams.get('password');
     } catch {}
@@ -599,8 +629,6 @@ function extractCredentials(bodyText) {
 
   return creds;
 }
-
-// ─── proxy helper: pipe request to upstream IPTV server ───────────
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -643,8 +671,6 @@ function proxyRequest(upstreamUrl, req, res) {
 
   proxyReq.end();
 }
-
-
 
 // ─── auth check ───────────────────────────────────────────────────
 
@@ -795,8 +821,6 @@ app.all('/player_api.php', async (req, res) => {
   const upstreamUrl = `${server}/player_api.php?${searchParams.toString()}`;
   console.log(`[proxy] ${req.method} /player_api.php?action=${action || 'auth'} → ${server}`);
 
-  // Auth / handshake request: rewrite user_info and server_info
-  // so IPTV Smarters Pro saves our proxy domain & user/pass
   if (!action) {
     try {
       const resp = await fetch(upstreamUrl, {
@@ -829,7 +853,6 @@ app.all('/player_api.php', async (req, res) => {
     }
   }
 
-  // All other actions (categories, streams, epg)
   proxyRequest(upstreamUrl, req, res);
 });
 
@@ -894,10 +917,6 @@ async function runRegistration() {
   const result = await doRegistration();
   lastStatus = result ? 'success' : 'failed';
 }
-
-// override the credential extraction in doRegistration
-// patch: after successful registration, extract and store credentials
-const originalDoRegistration = doRegistration;
 
 // ─── startup ──────────────────────────────────────────────────────
 
