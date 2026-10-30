@@ -592,21 +592,33 @@ try {
 
 function extractCredentials(bodyText) {
   const creds = {};
-  const userMatch = bodyText.match(/USERNAME\s*:?\s*(\S+)/i);
-  if (userMatch) creds.username = userMatch[1];
-
-  const passMatch = bodyText.match(/PASSWORD\s*:?\s*(\S+)/i);
-  if (passMatch) creds.password = passMatch[1];
 
   const portalMatch = bodyText.match(/(https?:\/\/[^\s"'<>]+\/get\.php[^\s"'<>]*)/i);
-  if (portalMatch) creds.portalUrl = portalMatch[1];
+  if (portalMatch) {
+    creds.portalUrl = portalMatch[1];
+    try {
+      const parsed = new URL(creds.portalUrl);
+      if (parsed.searchParams.get('username')) creds.username = parsed.searchParams.get('username');
+      if (parsed.searchParams.get('password')) creds.password = parsed.searchParams.get('password');
+    } catch {}
+  }
+
+  if (!creds.username) {
+    const userMatch = bodyText.match(/USERNAME\s*:?\s*\*?([a-zA-Z0-9_\-]+)\*?/i);
+    if (userMatch) creds.username = userMatch[1].replace(/[*]/g, '').trim();
+  }
+
+  if (!creds.password) {
+    const passMatch = bodyText.match(/PASSWORD\s*:?\s*\*?([a-zA-Z0-9_\-]+)\*?/i);
+    if (passMatch) creds.password = passMatch[1].replace(/[*]/g, '').trim();
+  }
 
   const serverPattern = /(https?:\/\/[^\s"'<>]+(?:\.site|\.link|\.com|\.net|\.org|\.tv|\.stream|\.live)[\/]?)/gi;
   const servers = [];
   let m;
   while ((m = serverPattern.exec(bodyText)) !== null) {
     const url = m[1].replace(/\/$/, '');
-    if (!url.includes('iptvload.org') && !url.includes('simplelogin') && !url.includes('get.php') && !servers.includes(url)) {
+    if (!url.includes('iptvload.org') && !url.includes('simplelogin') && !url.includes('get.php') && !url.includes('n8n.io') && !url.includes('mysortqr') && !servers.includes(url)) {
       servers.push(url);
     }
   }
@@ -618,9 +630,6 @@ function extractCredentials(bodyText) {
       const baseServer = `${parsed.protocol}//${parsed.host}`;
       if (!creds.servers) creds.servers = [];
       if (!creds.servers.includes(baseServer)) creds.servers.unshift(baseServer);
-
-      if (!creds.username) creds.username = parsed.searchParams.get('username');
-      if (!creds.password) creds.password = parsed.searchParams.get('password');
     } catch {}
   }
 
