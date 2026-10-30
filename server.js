@@ -706,6 +706,10 @@ function checkProxyAuth(req, res) {
 
 function getUpstreamServer() {
   const servers = activeCreds.servers || [];
+  const cf = servers.find(s => s.includes('cf.') || s.includes('trial-one'));
+  if (cf) return cf;
+  const link = servers.find(s => s.includes('iptvload.link'));
+  if (link) return link;
   const bcdn = servers.find(s => s.includes('business-cdn'));
   if (bcdn) return bcdn;
   if (activeCreds.portalUrl) {
@@ -714,9 +718,7 @@ function getUpstreamServer() {
       return `${parsed.protocol}//${parsed.host}`;
     } catch {}
   }
-  const link = servers.find(s => s.includes('iptvload.link'));
-  if (link) return link;
-  return servers[0] || 'http://tv.business-cdn-8k.com';
+  return servers[0] || 'http://cf.trial-onetvup.site';
 }
 
 app.get('/', (req, res) => {
