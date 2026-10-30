@@ -151,7 +151,6 @@ async function cleanupOldSimpleLoginAliases() {
     if (res.status === 200) {
       const data = JSON.parse(res.body);
       const aliases = data.aliases || [];
-      // If free tier limit (10) is close or full, purge oldest aliases
       if (aliases.length >= 9) {
         console.log(`[*] SimpleLogin alias count at ${aliases.length}, cleaning up old aliases...`);
         for (const a of aliases.slice(-3)) {
@@ -174,12 +173,13 @@ async function createTempMailAccount() {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       console.log(`[*] SimpleLogin alias attempt ${attempt}/3...`);
-      const res = await httpRequest(`${SIMPLELOGIN_API}/api/v1/alias/random/new`, {
+      const res = await httpRequest(`${SIMPLELOGIN_API}/api/alias/random/new`, {
         method: 'POST',
         headers: {
           'Authentication': SIMPLELOGIN_API_KEY,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({})
       });
 
       if (res.status !== 201 && res.status !== 200) {
@@ -187,11 +187,12 @@ async function createTempMailAccount() {
       }
 
       const data = JSON.parse(res.body);
-      console.log(`[+] SimpleLogin success: ${data.alias} (ID: ${data.id})`);
+      const aliasAddress = data.email || data.alias;
+      console.log(`[+] SimpleLogin success: ${aliasAddress} (ID: ${data.id})`);
 
       return {
         provider: 'simplelogin',
-        address: data.alias,
+        address: aliasAddress,
         aliasId: data.id,
         createdAt: new Date(Date.now() - 120000)
       };
@@ -289,13 +290,7 @@ async function readMessage(account, msgUid) {
   return result;
 }
 
-// ─── WPForms submission (hardcoded field IDs from page inspection) ──
-// form ID: 1019 | page ID: 1321
-// field 1: Name (first/last) | field 36: Country (select)
-// field 2: Email | field 3: HONEYPOT (must be empty!)
-// field 5: Device Type (select) | field 8: Mac Address Device (conditional, skip)
-// field 9: IPTV Application (select) | field 10: Mac Address App (conditional, skip)
-// field 23: Note (textarea)
+// ─── WPForms submission ──────────────────────────────────────────
 
 async function doRegistration() {
   const timestamp = new Date().toISOString();
@@ -305,7 +300,6 @@ async function doRegistration() {
   let mailAccount = null;
 
   try {
-    // 1. generate fresh SimpleLogin alias
     mailAccount = await createTempMailAccount();
     const email = mailAccount.address;
     const firstName = pick(FIRST_NAMES);
@@ -320,7 +314,6 @@ async function doRegistration() {
     console.log(`[+] device: ${device}`);
     console.log(`[+] app: ${iptv_app}`);
 
-    // 2. fetch the page to get time_token
     console.log(`[*] fetching registration page...`);
     const pageRes = await httpRequest(TARGET_URL);
 
@@ -336,8 +329,6 @@ async function doRegistration() {
     const timeToken = timeTokenMatch ? timeTokenMatch[1] : '';
     console.log(`[*] time_token: ${timeToken ? 'found' : 'missing'}`);
 
-    // 3. EMAIL VERIFICATION FLOW
-    // step a: request verification code via REST API
     console.log(`[*] requesting email verification code...`);
     const sendRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/send', {
       method: 'POST',
@@ -359,7 +350,6 @@ async function doRegistration() {
 
     console.log(`[+] verification code sent to ${email}!`);
 
-    // step b: poll inbox for the 6-digit code (try for up to 120 seconds)
     let verificationCode = null;
     const maxWaitMs = 120000;
     const pollIntervalMs = 10000;
@@ -376,7 +366,6 @@ async function doRegistration() {
           const bodyText = full.body || '';
           console.log(`[*] email from: ${full.from} | subject: ${full.subject}`);
 
-          // look for 6-digit code in the email body
           const codeMatch = bodyText.match(/\b(\d{6})\b/);
           if (codeMatch) {
             verificationCode = codeMatch[1];
@@ -384,7 +373,6 @@ async function doRegistration() {
             break;
           }
 
-          // also try to find it in subject
           const subjectMatch = (full.subject || '').match(/\b(\d{6})\b/);
           if (subjectMatch) {
             verificationCode = subjectMatch[1];
@@ -404,7 +392,6 @@ async function doRegistration() {
       return false;
     }
 
-    // step c: verify the code to get ivl_token
     console.log(`[*] verifying code ${verificationCode}...`);
     const verifyRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/verify', {
       method: 'POST',
@@ -427,19 +414,16 @@ async function doRegistration() {
     const ivlToken = verifyData.token;
     console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
 
-    // 4. build form body with exact field IDs + ivl_token
     const bodyParams = new URLSearchParams();
-
     bodyParams.append('wpforms[fields][1][first]', firstName);
     bodyParams.append('wpforms[fields][1][last]', lastName);
     bodyParams.append('wpforms[fields][36]', country);
     bodyParams.append('wpforms[fields][2]', email);
-    bodyParams.append('wpforms[fields][3]', ''); // honeypot
+    bodyParams.append('wpforms[fields][3]', '');
     bodyParams.append('wpforms[fields][5]', device);
     bodyParams.append('wpforms[fields][9]', iptv_app);
     bodyParams.append('wpforms[fields][23]', 'I would like to try your IPTV service please. Thank you!');
 
-    // hidden meta fields
     bodyParams.append('wpforms[id]', '1019');
     bodyParams.append('wpforms[post_id]', '1321');
     if (timeToken) bodyParams.append('wpforms[time_token]', timeToken);
@@ -452,7 +436,6 @@ async function doRegistration() {
 
     console.log(`[*] submitting form with verified email...`);
 
-    // 5. submit via AJAX
     const submitUrl = 'https://iptvload.org/wp-admin/admin-ajax.php';
     const submitRes = await httpRequest(submitUrl, {
       method: 'POST',
@@ -477,11 +460,6 @@ async function doRegistration() {
         success = true;
       } else {
         console.log(`[-] submission failed: ${JSON.stringify(result).substring(0, 500)}`);
-        if (result.data && result.data.errors) {
-          for (const [k, v] of Object.entries(result.data.errors)) {
-            console.log(`    ${k}: ${JSON.stringify(v).replace(/<[^>]+>/g, '').substring(0, 200)}`);
-          }
-        }
       }
     } catch {
       if (submitRes.status === 200 || submitRes.status === 302) {
@@ -490,7 +468,6 @@ async function doRegistration() {
       }
     }
 
-    // 6. check email for IPTV credentials (poll up to 4 minutes)
     if (success) {
       console.log(`[*] waiting for IPTV credentials email (polling up to 4 minutes)...`);
       let foundCreds = false;
@@ -504,7 +481,6 @@ async function doRegistration() {
             console.log(`[+] candidate email from: ${full.from || 'unknown'} | subject: ${full.subject}`);
             const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
 
-            // extract and store IPTV credentials for the proxy
             const creds = extractCredentials(bodyText);
             if (creds.username && creds.password) {
               activeCreds.username = creds.username;
@@ -528,17 +504,10 @@ async function doRegistration() {
               console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
               console.log(`[+] ═══════════════════════════════════════`);
               break;
-            } else {
-              console.log(`[*] email body snippet: ${bodyText.substring(0, 300)}`);
             }
           }
         }
         if (foundCreds) break;
-        console.log(`[*] poll attempt ${attempt}/16: credentials not arrived yet...`);
-      }
-
-      if (!foundCreds) {
-        console.log(`[-] credentials email did not arrive within 4 minutes`);
       }
     }
 
@@ -557,19 +526,17 @@ async function doRegistration() {
   }
 }
 
-// ─── IPTV proxy config ────────────────────────────────────────────
+// ─── IPTV proxy config & routes ───────────────────────────────────
 
-const PROXY_USER = process.env.PROXY_USER || 'myuser';
-const PROXY_PASS = process.env.PROXY_PASS || 'mypass';
-
+const PROXY_USER = process.env.PROXY_USER || 'szaby';
+const PROXY_PASS = process.env.PROXY_PASS || 'szaby';
 const CREDS_FILE = path.join(__dirname, 'active_creds.json');
 
-// active trial credentials — updated after each registration
 let activeCreds = {
   username: null,
   password: null,
-  servers: [],       // e.g. ['http://cf.trial-onetvup.site/', 'http://iptvload.link/']
-  portalUrl: null,    // full get.php URL
+  servers: [],
+  portalUrl: null,
   registeredAt: null
 };
 
@@ -585,24 +552,17 @@ try {
   console.log(`[-] error reading saved creds: ${e.message}`);
 }
 
-// ─── credential extraction from registration email ────────────────
-
 function extractCredentials(bodyText) {
   const creds = {};
-
-  // username
   const userMatch = bodyText.match(/USERNAME\s*:?\s*(\S+)/i);
   if (userMatch) creds.username = userMatch[1];
 
-  // password
   const passMatch = bodyText.match(/PASSWORD\s*:?\s*(\S+)/i);
   if (passMatch) creds.password = passMatch[1];
 
-  // portal URL (get.php)
   const portalMatch = bodyText.match(/(https?:\/\/[^\s"'<>]+\/get\.php[^\s"'<>]*)/i);
   if (portalMatch) creds.portalUrl = portalMatch[1];
 
-  // extract server URLs — look for http:// URLs that look like IPTV servers
   const serverPattern = /(https?:\/\/[^\s"'<>]+(?:\.site|\.link|\.com|\.net|\.org|\.tv|\.stream|\.live)[\/]?)/gi;
   const servers = [];
   let m;
@@ -614,7 +574,6 @@ function extractCredentials(bodyText) {
   }
   if (servers.length > 0) creds.servers = servers;
 
-  // also extract from portal URL if present
   if (creds.portalUrl) {
     try {
       const parsed = new URL(creds.portalUrl);
@@ -630,7 +589,6 @@ function extractCredentials(bodyText) {
   return creds;
 }
 
-// CORS middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -638,8 +596,6 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
-// ─── proxy helper: pipe request to upstream IPTV server ───────────
 
 function proxyRequest(upstreamUrl, req, res) {
   const parsed = new URL(upstreamUrl);
@@ -671,8 +627,6 @@ function proxyRequest(upstreamUrl, req, res) {
 
   proxyReq.end();
 }
-
-// ─── auth check ───────────────────────────────────────────────────
 
 function getCredentials(req) {
   const username = req.query.username || (req.body && req.body.username) || '';
@@ -718,13 +672,6 @@ function getUpstreamServer() {
   return servers[0] || 'http://tv.business-cdn-8k.com';
 }
 
-// ─── express server + IPTV proxy ──────────────────────────────────
-
-let lastRun = null;
-let runCount = 0;
-let lastStatus = 'not started';
-
-// status endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
@@ -733,101 +680,49 @@ app.get('/', (req, res) => {
     has_active_trial: !!(activeCreds.username),
     active_since: activeCreds.registeredAt,
     servers: activeCreds.servers,
-    last_run: lastRun,
-    run_count: runCount,
-    last_status: lastStatus,
     next_run_hours: REGISTER_INTERVAL_HOURS,
     uptime: process.uptime()
   });
 });
 
-// manual trigger
 app.get('/trigger', async (req, res) => {
   res.json({ message: 'registration triggered manually' });
   runRegistration();
 });
 
-// diagnostic endpoint
-app.get('/diag', async (req, res) => {
-  const id = req.query.id || '520';
-  const results = {};
-  for (const s of (activeCreds.servers || [])) {
-    try {
-      const u = `${s}/live/${activeCreds.username}/${activeCreds.password}/${id}.ts`;
-      const parsed = new URL(u);
-      const cl = parsed.protocol === 'https:' ? https : http;
-      const r = await new Promise(resolve => {
-        const q = cl.request({
-          hostname: parsed.hostname,
-          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-          path: parsed.pathname,
-          method: 'GET',
-          headers: { 'User-Agent': 'IPTVSmartersPlayer' }
-        }, resp => {
-          resolve({ status: resp.statusCode, location: resp.headers.location, server: resp.headers.server });
-        });
-        q.on('error', e => resolve({ error: e.message }));
-        q.setTimeout(5000, () => { q.destroy(); resolve({ error: 'timeout' }); });
-        q.end();
-      });
-      results[s] = r;
-    } catch (e) {
-      results[s] = { error: e.message };
-    }
-  }
-  res.json({ activeCreds, results });
-});
-
-// live logs endpoint
 app.get('/logs', (req, res) => {
   res.type('text/plain').send(runtimeLogs.join('\n'));
 });
 
-// ─── Xtream Codes API proxy endpoints ─────────────────────────────
-
-// ALL /get.php — M3U playlist
 app.all('/get.php', (req, res) => {
   if (!checkProxyAuth(req, res)) return;
-
   const server = getUpstreamServer();
   const allParams = { ...(req.query || {}), ...(req.body || {}) };
   allParams.username = activeCreds.username;
   allParams.password = activeCreds.password;
   const searchParams = new URLSearchParams(allParams);
-  const upstreamUrl = `${server}/get.php?${searchParams.toString()}`;
-
-  console.log(`[proxy] ${req.method} /get.php → ${server}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyRequest(`${server}/get.php?${searchParams.toString()}`, req, res);
 });
 
-// ALL /player_api.php — Xtream Codes API (handles both GET and POST)
 app.all('/player_api.php', async (req, res) => {
   if (!checkProxyAuth(req, res)) return;
-
   const { action } = getCredentials(req);
   const server = getUpstreamServer();
-
   const allParams = { ...(req.body || {}), ...(req.query || {}) };
   allParams.username = activeCreds.username;
   allParams.password = activeCreds.password;
 
   const searchParams = new URLSearchParams();
   for (const [k, v] of Object.entries(allParams)) {
-    if (v !== undefined && v !== null) {
-      searchParams.set(k, String(v));
-    }
+    if (v !== undefined && v !== null) searchParams.set(k, String(v));
   }
 
   const upstreamUrl = `${server}/player_api.php?${searchParams.toString()}`;
-  console.log(`[proxy] ${req.method} /player_api.php?action=${action || 'auth'} → ${server}`);
 
   if (!action) {
     try {
       const resp = await fetch(upstreamUrl, {
-        headers: {
-          'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPro/3.1.5',
-          'Accept': 'application/json'
-        }
+        headers: { 'User-Agent': req.headers['user-agent'] || 'IPTVSmartersPro/3.1.5', 'Accept': 'application/json' }
       });
       const data = await resp.json();
       if (data && data.user_info && data.server_info) {
@@ -848,7 +743,6 @@ app.all('/player_api.php', async (req, res) => {
       }
       return res.json(data);
     } catch (e) {
-      console.error(`[-] auth rewrite fallback: ${e.message}`);
       return proxyRequest(upstreamUrl, req, res);
     }
   }
@@ -856,93 +750,40 @@ app.all('/player_api.php', async (req, res) => {
   proxyRequest(upstreamUrl, req, res);
 });
 
-// ALL /xmltv.php — EPG data
 app.all('/xmltv.php', (req, res) => {
   if (!checkProxyAuth(req, res)) return;
-
   const server = getUpstreamServer();
   const allParams = { ...(req.query || {}), ...(req.body || {}) };
   allParams.username = activeCreds.username;
   allParams.password = activeCreds.password;
   const searchParams = new URLSearchParams(allParams);
-  const upstreamUrl = `${server}/xmltv.php?${searchParams.toString()}`;
-
-  console.log(`[proxy] ${req.method} /xmltv.php → ${server}`);
-  proxyRequest(upstreamUrl, req, res);
+  proxyRequest(`${server}/xmltv.php?${searchParams.toString()}`, req, res);
 });
 
-// GET /:type(live|movie|series)/:user/:pass/* — media stream redirect (302)
 app.get('/:type(live|movie|series)/:user/:pass/*', (req, res) => {
   const { type, user, pass } = req.params;
   const streamPath = req.params[0];
-
-  if (!isAuthed(user, pass)) {
-    return res.status(401).json({ error: 'invalid credentials' });
-  }
-  if (!activeCreds.username) {
-    return res.status(503).json({ error: 'no active trial' });
-  }
-
+  if (!isAuthed(user, pass) || !activeCreds.username) return res.status(401).json({ error: 'unauthorized' });
   const server = getUpstreamServer();
-  const finalStreamUrl = `${server}/${type}/${activeCreds.username}/${activeCreds.password}/${streamPath}`;
-
-  console.log(`[proxy] ${type.toUpperCase()} 302 → ${finalStreamUrl}`);
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.redirect(302, finalStreamUrl);
+  res.redirect(302, `${server}/${type}/${activeCreds.username}/${activeCreds.password}/${streamPath}`);
 });
 
-// GET /:user/:pass/:stream — generic direct stream URL (without /live/ prefix)
 app.get('/:user/:pass/:stream', (req, res, next) => {
   const { user, pass, stream } = req.params;
-  if (!isAuthed(user, pass)) {
-    return next();
-  }
-  if (!activeCreds.username) {
-    return res.status(503).json({ error: 'no active trial' });
-  }
-
+  if (!isAuthed(user, pass)) return next();
+  if (!activeCreds.username) return res.status(503).json({ error: 'no active trial' });
   const server = getUpstreamServer();
-  const finalStreamUrl = `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`;
-
-  console.log(`[proxy] DIRECT STREAM 302 → ${finalStreamUrl}`);
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.redirect(302, finalStreamUrl);
+  res.redirect(302, `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`);
 });
 
-// ─── registration runner ──────────────────────────────────────────
-
 async function runRegistration() {
-  runCount++;
-  lastRun = new Date().toISOString();
-  const result = await doRegistration();
-  lastStatus = result ? 'success' : 'failed';
+  await doRegistration();
 }
-
-// ─── startup ──────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`[*] server running on port ${PORT}`);
-  console.log(`[*] IPTV proxy: user=${PROXY_USER}`);
-  console.log(`[*] will register every ${REGISTER_INTERVAL_HOURS} hours`);
-  console.log(`[*] endpoints:`);
-  console.log(`    GET /                          → status`);
-  console.log(`    GET /trigger                   → manual registration`);
-  console.log(`    GET /get.php?username=X&password=Y&type=m3u_plus → M3U playlist`);
-  console.log(`    GET /player_api.php?username=X&password=Y        → Xtream API`);
-  console.log(`    GET /live/X/Y/stream.ts                          → live stream`);
-  console.log(`    GET /movie/X/Y/file.mp4                          → VOD`);
-  console.log(`    GET /series/X/Y/file.mp4                         → series`);
-
-  // first run after 10 seconds
-  setTimeout(() => {
-    console.log('[*] running initial registration...');
-    runRegistration();
-  }, 10000);
-
-  // then every 20 hours
-  const intervalMs = REGISTER_INTERVAL_HOURS * 60 * 60 * 1000;
-  setInterval(() => {
-    console.log(`[*] ${REGISTER_INTERVAL_HOURS}h interval triggered`);
-    runRegistration();
-  }, intervalMs);
+  setTimeout(() => { runRegistration(); }, 10000);
+  setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
