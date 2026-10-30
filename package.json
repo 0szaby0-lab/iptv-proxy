@@ -1,16 +1,18 @@
 {
-  "name": "iptv-auto-register",
+  "name": "iptv-auto-proxy",
   "version": "1.0.0",
-  "description": "Auto-register IPTV free trial every 20 hours",
+  "description": "IPTV auto-registration and Xtream Codes proxy service",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "dependencies": {
+    "express": "^4.19.2",
+    "imapflow": "^1.0.162",
+    "mailparser": "^3.7.1",
+    "node-cron": "^3.0.3"
+  },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "node-cron": "^3.0.3",
-    "express": "^4.18.2"
   }
 }
