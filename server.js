@@ -583,6 +583,8 @@ try {
     const saved = JSON.parse(fs.readFileSync(CREDS_FILE, 'utf8'));
     if (saved && saved.username && saved.password) {
       activeCreds = saved;
+      activeCreds.username = activeCreds.username.replace(/[*]/g, '').trim();
+      activeCreds.password = activeCreds.password.replace(/[*]/g, '').replace(/Start.*$/i, '').trim();
       console.log(`[+] loaded saved active credentials: ${activeCreds.username}`);
     }
   }
