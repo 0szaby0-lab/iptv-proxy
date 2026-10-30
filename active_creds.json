@@ -1,11 +1,11 @@
 {
-  "username": "iptvload1akm",
-  "password": "11903893bf",
+  "username": "iptvloaduerb",
+  "password": "79a49ea9be",
   "servers": [
     "http://cf.trial-onetvup.site",
     "http://iptvload.link",
     "http://tv.business-cdn-8k.com"
   ],
-  "portalUrl": null,
-  "registeredAt": "2026-10-28T15:06:33.180Z"
+  "portalUrl": "http://tv.business-cdn-8k.com/get.php?username=iptvloaduerb&password=79a49ea9be&type=m3u_plus&output=ts",
+  "registeredAt": "2026-10-30T13:42:46.146Z"
 }

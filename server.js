@@ -829,12 +829,55 @@ app.get('/:user/:pass/:stream', (req, res, next) => {
   res.redirect(302, `${server}/live/${activeCreds.username}/${activeCreds.password}/${stream}`);
 });
 
+async function syncLatestCredsFromInbox() {
+  try {
+    const client = new ImapFlow(IMAP_CONFIG);
+    await client.connect();
+    for (const box of ['INBOX', '[Gmail]/Spam']) {
+      try {
+        const lock = await client.getMailboxLock(box);
+        try {
+          const uids = await client.search({ from: 'iptvload' }, { uid: true });
+          if (uids && uids.length > 0) {
+            for (const uid of uids.reverse()) {
+              const msg = await client.fetchOne(String(uid), { source: true, envelope: true }, { uid: true });
+              if (msg && msg.envelope.subject && msg.envelope.subject.toLowerCase().includes('trial')) {
+                const parsed = await simpleParser(msg.source);
+                const creds = extractCredentials(parsed.text || parsed.html || '');
+                if (creds.username && creds.password) {
+                  activeCreds.username = creds.username;
+                  activeCreds.password = creds.password;
+                  activeCreds.portalUrl = creds.portalUrl || null;
+                  activeCreds.servers = creds.servers || [];
+                  activeCreds.registeredAt = msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString();
+                  console.log(`[+] Synced latest IPTV creds from mailbox: ${activeCreds.username} (password: ${activeCreds.password})`);
+                  try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
+                  lock.release();
+                  await client.logout();
+                  return true;
+                }
+              }
+            }
+          }
+        } finally {
+          try { lock.release(); } catch {}
+        }
+      } catch {}
+    }
+    await client.logout();
+  } catch (err) {
+    console.log(`[-] Mailbox creds sync warning: ${err.message}`);
+  }
+  return false;
+}
+
 async function runRegistration() {
   await doRegistration();
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[*] server running on port ${PORT}`);
+  await syncLatestCredsFromInbox();
   setTimeout(() => { runRegistration(); }, 10000);
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
