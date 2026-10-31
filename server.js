@@ -140,34 +140,106 @@ function httpRequest(url, options = {}) {
   });
 }
 
-// ─── temp email (SimpleLogin API + Gmail IMAP) ───────────────────
+// ─── temp email (Emailnator API + Gmail IMAP fallback) ───────────
 
-async function cleanupOldSimpleLoginAliases() {
-  try {
-    const res = await httpRequest(`${SIMPLELOGIN_API}/api/v2/aliases?page_id=0`, {
-      method: 'GET',
-      headers: { 'Authentication': SIMPLELOGIN_API_KEY }
-    });
-    if (res.status === 200) {
-      const data = JSON.parse(res.body);
-      const aliases = data.aliases || [];
-      if (aliases.length >= 9) {
-        console.log(`[*] SimpleLogin alias count at ${aliases.length}, cleaning up old aliases...`);
-        for (const a of aliases.slice(-3)) {
-          await httpRequest(`${SIMPLELOGIN_API}/api/aliases/${a.id}`, {
-            method: 'DELETE',
-            headers: { 'Authentication': SIMPLELOGIN_API_KEY }
-          });
-          console.log(`[+] deleted old alias: ${a.email} (ID: ${a.id})`);
+async function generateEmailnatorAccount() {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      console.log(`[*] Emailnator GoogleMail generation attempt ${attempt}/5...`);
+      const res = await httpRequest('https://www.emailnator.com/api/generate-email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Origin': 'https://www.emailnator.com',
+          'Referer': 'https://www.emailnator.com/'
+        },
+        body: JSON.stringify({ ids: [8] })
+      });
+
+      if (res.status === 200) {
+        const data = JSON.parse(res.body);
+        if (data.status === 'success' && data.email) {
+          console.log(`[+] Emailnator GoogleMail generated: ${data.email}`);
+          return {
+            provider: 'emailnator',
+            address: data.email,
+            createdAt: Date.now(),
+            createdAtSeconds: Math.floor(Date.now() / 1000)
+          };
         }
       }
+      console.log(`[-] Emailnator HTTP ${res.status}: ${res.body.substring(0, 100)}`);
+    } catch (err) {
+      console.log(`[-] Emailnator attempt ${attempt} error: ${err.message}`);
+    }
+    await sleep(2500 * attempt);
+  }
+  return null;
+}
+
+async function checkEmailnatorInbox(account) {
+  try {
+    const res = await httpRequest('https://www.emailnator.com/api/message-list', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Origin': 'https://www.emailnator.com',
+        'Referer': 'https://www.emailnator.com/'
+      },
+      body: JSON.stringify({ email: account.address, limit: 25 })
+    });
+
+    if (res.status === 200) {
+      const data = JSON.parse(res.body);
+      const messages = (data.messages || []).filter(m => {
+        return !account.createdAtSeconds || (m.timestamp >= account.createdAtSeconds - 120);
+      });
+      return messages.map(m => ({
+        id: m.id,
+        from: m.from || '',
+        subject: m.subject || '',
+        timestamp: m.timestamp,
+        timeAgo: m.time_ago
+      }));
     }
   } catch (err) {
-    console.log(`[-] alias cleanup check warning: ${err.message}`);
+    console.log(`[-] Emailnator checkInbox error: ${err.message}`);
   }
+  return [];
+}
+
+async function readEmailnatorMessage(msgId) {
+  try {
+    const res = await httpRequest(`https://www.emailnator.com/api/message/${encodeURIComponent(msgId)}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://www.emailnator.com',
+        'Referer': 'https://www.emailnator.com/'
+      }
+    });
+
+    if (res.status === 200) {
+      const data = JSON.parse(res.body);
+      return {
+        from: data.from || '',
+        subject: data.subject || '',
+        body: data.content || ''
+      };
+    }
+  } catch (err) {
+    console.log(`[-] Emailnator readMessage error: ${err.message}`);
+  }
+  return { from: '', subject: '', body: '' };
 }
 
 async function createTempMailAccount() {
+  const emailnatorAcc = await generateEmailnatorAccount();
+  if (emailnatorAcc) return emailnatorAcc;
+
+  console.log(`[*] Emailnator unavailable, attempting SimpleLogin fallback...`);
   await cleanupOldSimpleLoginAliases();
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -201,11 +273,20 @@ async function createTempMailAccount() {
       if (attempt < 3) await sleep(3000 * attempt);
     }
   }
-  throw new Error('Failed to create SimpleLogin alias after 3 attempts');
+
+  // Final fallback to Gmail IMAP alias
+  const userBase = (IMAP_CONFIG.auth.user || '').replace(/@gmail\.com$/i, '');
+  const gmailAlias = `${userBase}+tv${randInt(10000, 99999)}@gmail.com`;
+  console.log(`[*] Using Gmail alias fallback: ${gmailAlias}`);
+  return {
+    provider: 'gmail_imap',
+    address: gmailAlias,
+    createdAt: new Date(Date.now() - 60000)
+  };
 }
 
 async function deleteTempMailAccount(account) {
-  if (!account || !account.aliasId) return;
+  if (!account || !account.aliasId || account.provider !== 'simplelogin') return;
   try {
     const res = await httpRequest(`${SIMPLELOGIN_API}/api/aliases/${account.aliasId}`, {
       method: 'DELETE',
@@ -224,12 +305,15 @@ async function deleteTempMailAccount(account) {
 }
 
 async function checkInbox(account) {
+  if (account && account.provider === 'emailnator') {
+    return await checkEmailnatorInbox(account);
+  }
+
   const client = new ImapFlow(IMAP_CONFIG);
   const messages = [];
 
   try {
     await client.connect();
-    // Gmail routes iptvload emails to [Gmail]/Spam, check both Spam and INBOX
     const boxes = ['[Gmail]/Spam', 'INBOX'];
     for (const box of boxes) {
       try {
@@ -239,7 +323,6 @@ async function checkInbox(account) {
           if (uids && uids.length > 0) {
             const recentUids = uids.slice(-15).reverse();
             for await (const msg of client.fetch(recentUids, { uid: true, envelope: true })) {
-              const toList = (msg.envelope.to || []).map(t => (t.address || '').toLowerCase());
               const subject = msg.envelope.subject || '';
               const from = msg.envelope.from?.[0]?.address || '';
 
@@ -272,6 +355,11 @@ async function checkInbox(account) {
 }
 
 async function readMessage(account, msgRef) {
+  if (account && account.provider === 'emailnator') {
+    const msgId = typeof msgRef === 'object' ? msgRef.id : msgRef;
+    return await readEmailnatorMessage(msgId);
+  }
+
   const client = new ImapFlow(IMAP_CONFIG);
   let result = { from: '', subject: '', body: '' };
 
@@ -318,57 +406,26 @@ async function doRegistration() {
 
   let mailAccount = null;
 
-  try {
-    mailAccount = await createTempMailAccount();
-    let email = mailAccount.address;
-    const firstName = pick(FIRST_NAMES);
-    const lastName = pick(LAST_NAMES);
-    const country = pick(COUNTRIES);
-    const device = pick(DEVICES);
-    const iptv_app = pick(APPS);
+  for (let regAttempt = 1; regAttempt <= 8; regAttempt++) {
+    try {
+      console.log(`\n[*] Registration cycle attempt ${regAttempt}/8...`);
+      mailAccount = await createTempMailAccount();
+      let email = mailAccount.address;
+      const firstName = pick(FIRST_NAMES);
+      const lastName = pick(LAST_NAMES);
+      const fullName = `${firstName} ${lastName}`;
+      const country = pick(COUNTRIES);
+      const device = pick(DEVICES);
+      const iptv_app = pick(APPS);
 
-    console.log(`[+] email: ${email}`);
-    console.log(`[+] name: ${firstName} ${lastName}`);
-    console.log(`[+] country: ${country}`);
-    console.log(`[+] device: ${device}`);
-    console.log(`[+] app: ${iptv_app}`);
+      console.log(`[+] email: ${email}`);
+      console.log(`[+] name: ${fullName}`);
+      console.log(`[+] country: ${country}`);
+      console.log(`[+] device: ${device}`);
+      console.log(`[+] app: ${iptv_app}`);
 
-    console.log(`[*] fetching registration page...`);
-    const pageRes = await httpRequest(TARGET_URL);
-
-    if (pageRes.status !== 200) {
-      console.error(`[-] page returned ${pageRes.status}`);
-      return false;
-    }
-
-    const html = pageRes.body;
-    const cookies = pageRes.cookies.map(c => c.split(';')[0]).join('; ');
-
-    const timeTokenMatch = html.match(/name="wpforms\[time_token\]"\s+value="([^"]+)"/);
-    const timeToken = timeTokenMatch ? timeTokenMatch[1] : '';
-    console.log(`[*] time_token: ${timeToken ? 'found' : 'missing'}`);
-
-    console.log(`[*] requesting email verification code...`);
-    let sendRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/send', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Origin': 'https://iptvload.org',
-        'Referer': TARGET_URL
-      },
-      body: JSON.stringify({ form_id: 1019, email: email })
-    });
-
-    let sendData = JSON.parse(sendRes.body);
-    console.log(`[*] send response: ${JSON.stringify(sendData)}`);
-
-    if (!sendData.ok && sendData.code === 'provider') {
-      console.log(`[-] SimpleLogin alias rejected by provider filter, falling back to Gmail alias...`);
-      const userBase = IMAP_CONFIG.auth.user.replace(/@gmail\.com$/i, '');
-      email = `${userBase}+tv${randInt(10000, 99999)}@gmail.com`;
-      mailAccount.address = email;
-      console.log(`[*] re-requesting verification code with Gmail address: ${email}`);
-      sendRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/send', {
+      console.log(`[*] requesting email verification code...`);
+      let sendRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/send', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -377,140 +434,168 @@ async function doRegistration() {
         },
         body: JSON.stringify({ form_id: 1019, email: email })
       });
-      sendData = JSON.parse(sendRes.body);
-      console.log(`[*] send response (Gmail alias): ${JSON.stringify(sendData)}`);
-    }
 
-    if (!sendData.ok) {
-      console.error(`[-] failed to send verification code: ${sendData.message || sendData.code}`);
-      return false;
-    }
+      let sendData = {};
+      try { sendData = JSON.parse(sendRes.body); } catch {}
+      console.log(`[*] send response: ${JSON.stringify(sendData)}`);
 
-    console.log(`[+] verification code sent to ${email}!`);
+      if (!sendData.ok) {
+        console.log(`[-] send failed (${sendData.code || sendRes.status}): ${sendData.message || 'unknown error'}`);
+        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        await sleep(3000);
+        continue;
+      }
 
-    let verificationCode = null;
-    const maxWaitMs = 120000;
-    const pollIntervalMs = 10000;
-    const startTime = Date.now();
+      console.log(`[+] verification code sent to ${email}!`);
 
-    while (Date.now() - startTime < maxWaitMs) {
-      console.log(`[*] checking inbox... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
-      await sleep(pollIntervalMs);
+      let verificationCode = null;
+      const maxWaitMs = 90000;
+      const pollIntervalMs = 6000;
+      const startTime = Date.now();
 
-      try {
-        const messages = await checkInbox(mailAccount);
-        for (const msg of messages) {
-          const full = await readMessage(mailAccount, msg.id);
-          const bodyText = full.body || '';
-          console.log(`[*] email from: ${full.from} | subject: ${full.subject}`);
+      while (Date.now() - startTime < maxWaitMs) {
+        console.log(`[*] checking inbox... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
+        await sleep(pollIntervalMs);
 
-          const codeMatch = bodyText.match(/\b(\d{6})\b/);
-          if (codeMatch) {
-            verificationCode = codeMatch[1];
-            console.log(`[+] VERIFICATION CODE FOUND: ${verificationCode}`);
-            break;
+        try {
+          const messages = await checkInbox(mailAccount);
+          for (const msg of messages) {
+            const subject = msg.subject || '';
+            const from = msg.from || '';
+
+            // check subject for 6-digit code
+            const subjectMatch = subject.match(/\b(\d{6})\b/);
+            if (subjectMatch) {
+              verificationCode = subjectMatch[1];
+              console.log(`[+] VERIFICATION CODE FROM SUBJECT: ${verificationCode}`);
+              break;
+            }
+
+            // read body for code
+            const full = await readMessage(mailAccount, msg.id);
+            const bodyText = full.body || '';
+            const codeMatch = bodyText.match(/\b(\d{6})\b/);
+            if (codeMatch) {
+              verificationCode = codeMatch[1];
+              console.log(`[+] VERIFICATION CODE FOUND IN BODY: ${verificationCode}`);
+              break;
+            }
           }
+        } catch (err) {
+          console.log(`[-] inbox check error: ${err.message}`);
+        }
 
-          const subjectMatch = (full.subject || '').match(/\b(\d{6})\b/);
-          if (subjectMatch) {
-            verificationCode = subjectMatch[1];
-            console.log(`[+] VERIFICATION CODE FROM SUBJECT: ${verificationCode}`);
-            break;
+        if (verificationCode) break;
+      }
+
+      if (!verificationCode) {
+        console.error(`[-] could not retrieve verification code within ${maxWaitMs / 1000}s, retrying with fresh email...`);
+        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        continue;
+      }
+
+      console.log(`[*] verifying code ${verificationCode}...`);
+      const verifyRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/verify', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Origin': 'https://iptvload.org',
+          'Referer': TARGET_URL
+        },
+        body: JSON.stringify({ form_id: 1019, email: email, code: verificationCode })
+      });
+
+      let verifyData = {};
+      try { verifyData = JSON.parse(verifyRes.body); } catch {}
+      console.log(`[*] verify response: ${JSON.stringify(verifyData)}`);
+
+      if (!verifyData.ok || !verifyData.token) {
+        console.error(`[-] verification failed: ${verifyData.message || verifyData.code}, retrying...`);
+        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        continue;
+      }
+
+      const ivlToken = verifyData.token;
+      console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
+
+      console.log(`[*] fetching registration page for tokens...`);
+      const pageRes = await httpRequest(TARGET_URL);
+      const cookies = (pageRes.cookies || []).map(c => c.split(';')[0]).join('; ');
+      const timeTokenMatch = (pageRes.body || '').match(/name="wpforms\[time_token\]"\s+value="([^"]+)"/);
+      const timeToken = timeTokenMatch ? timeTokenMatch[1] : '';
+
+      const bodyParams = new URLSearchParams();
+      bodyParams.append('wpforms[fields][1]', fullName);
+      bodyParams.append('wpforms[fields][1][first]', firstName);
+      bodyParams.append('wpforms[fields][1][last]', lastName);
+      bodyParams.append('wpforms[fields][36]', country);
+      bodyParams.append('wpforms[fields][2]', email);
+      bodyParams.append('wpforms[fields][3]', '');
+      bodyParams.append('wpforms[fields][5]', device);
+      bodyParams.append('wpforms[fields][9]', iptv_app);
+      bodyParams.append('wpforms[fields][23]', 'I would like to try your IPTV service please. Thank you!');
+
+      bodyParams.append('wpforms[id]', '1019');
+      bodyParams.append('wpforms[post_id]', '1321');
+      if (timeToken) bodyParams.append('wpforms[time_token]', timeToken);
+      bodyParams.append('wpforms[hp]', '');
+      bodyParams.append('page_title', 'Free IPTV Trial');
+      bodyParams.append('page_url', TARGET_URL);
+      bodyParams.append('page_id', '1321');
+      bodyParams.append('action', 'wpforms_submit');
+      bodyParams.append('ivl_token', ivlToken);
+
+      console.log(`[*] submitting WPForms...`);
+      const submitUrl = 'https://iptvload.org/wp-admin/admin-ajax.php';
+      const submitRes = await httpRequest(submitUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Cookie': cookies,
+          'Referer': TARGET_URL,
+          'Origin': 'https://iptvload.org',
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: bodyParams.toString()
+      });
+
+      console.log(`[*] submit response: ${submitRes.status}`);
+      console.log(`[*] response body: ${submitRes.body.substring(0, 400)}`);
+
+      let formSuccess = false;
+      try {
+        const result = JSON.parse(submitRes.body);
+        if (result.success || (result.data && !result.data.errors)) {
+          console.log(`[+] FORM SUBMITTED SUCCESSFULLY!`);
+          formSuccess = true;
+        } else {
+          console.log(`[-] submission failed: ${JSON.stringify(result).substring(0, 400)}`);
+          if (submitRes.body.includes('already been used')) {
+            console.log(`[-] email was previously used, retrying with fresh email...`);
+            if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+            await sleep(3000);
+            continue;
           }
         }
-      } catch (err) {
-        console.log(`[-] inbox check error: ${err.message}`);
+      } catch {
+        if (submitRes.status === 200 || submitRes.status === 302) {
+          console.log(`[+] form submitted (non-JSON response)`);
+          formSuccess = true;
+        }
       }
 
-      if (verificationCode) break;
-    }
-
-    if (!verificationCode) {
-      console.error(`[-] could not retrieve verification code within ${maxWaitMs / 1000}s`);
-      return false;
-    }
-
-    console.log(`[*] verifying code ${verificationCode}...`);
-    const verifyRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/verify', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Origin': 'https://iptvload.org',
-        'Referer': TARGET_URL
-      },
-      body: JSON.stringify({ form_id: 1019, email: email, code: verificationCode })
-    });
-
-    const verifyData = JSON.parse(verifyRes.body);
-    console.log(`[*] verify response: ${JSON.stringify(verifyData)}`);
-
-    if (!verifyData.ok || !verifyData.token) {
-      console.error(`[-] verification failed: ${verifyData.message || verifyData.code}`);
-      return false;
-    }
-
-    const ivlToken = verifyData.token;
-    console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
-
-    const bodyParams = new URLSearchParams();
-    bodyParams.append('wpforms[fields][1][first]', firstName);
-    bodyParams.append('wpforms[fields][1][last]', lastName);
-    bodyParams.append('wpforms[fields][36]', country);
-    bodyParams.append('wpforms[fields][2]', email);
-    bodyParams.append('wpforms[fields][3]', '');
-    bodyParams.append('wpforms[fields][5]', device);
-    bodyParams.append('wpforms[fields][9]', iptv_app);
-    bodyParams.append('wpforms[fields][23]', 'I would like to try your IPTV service please. Thank you!');
-
-    bodyParams.append('wpforms[id]', '1019');
-    bodyParams.append('wpforms[post_id]', '1321');
-    if (timeToken) bodyParams.append('wpforms[time_token]', timeToken);
-    bodyParams.append('wpforms[hp]', '');
-    bodyParams.append('page_title', 'Free IPTV Trial');
-    bodyParams.append('page_url', TARGET_URL);
-    bodyParams.append('page_id', '1321');
-    bodyParams.append('action', 'wpforms_submit');
-    bodyParams.append('ivl_token', ivlToken);
-
-    console.log(`[*] submitting form with verified email...`);
-
-    const submitUrl = 'https://iptvload.org/wp-admin/admin-ajax.php';
-    const submitRes = await httpRequest(submitUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookies,
-        'Referer': TARGET_URL,
-        'Origin': 'https://iptvload.org',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      body: bodyParams.toString()
-    });
-
-    console.log(`[*] submit response: ${submitRes.status}`);
-    console.log(`[*] response body: ${submitRes.body.substring(0, 500)}`);
-
-    let success = false;
-    try {
-      const result = JSON.parse(submitRes.body);
-      if (result.success || (result.data && !result.data.errors)) {
-        console.log(`[+] FORM SUBMITTED SUCCESSFULLY!`);
-        success = true;
-      } else {
-        console.log(`[-] submission failed: ${JSON.stringify(result).substring(0, 500)}`);
+      if (!formSuccess) {
+        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        await sleep(3000);
+        continue;
       }
-    } catch {
-      if (submitRes.status === 200 || submitRes.status === 302) {
-        console.log(`[+] form submitted (non-JSON response)`);
-        success = true;
-      }
-    }
 
-    if (success) {
       console.log(`[*] waiting for IPTV credentials email (polling up to 4 minutes)...`);
       let foundCreds = false;
-      for (let attempt = 1; attempt <= 16; attempt++) {
+      for (let pollAttempt = 1; pollAttempt <= 16; pollAttempt++) {
         await sleep(15000);
+
+        // Check temp mail account inbox
         const messages = await checkInbox(mailAccount);
         if (messages && messages.length > 0) {
           for (const msg of messages) {
@@ -527,41 +612,70 @@ async function doRegistration() {
               activeCreds.servers = creds.servers || [];
               activeCreds.registeredAt = new Date().toISOString();
               foundCreds = true;
-
-              try {
-                fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2));
-              } catch (e) {
-                console.log(`[-] error saving creds to disk: ${e.message}`);
-              }
-
-              console.log(`[+] ═══════════════════════════════════════`);
-              console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
-              console.log(`[+]   username: ${activeCreds.username}`);
-              console.log(`[+]   password: ${activeCreds.password}`);
-              console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
-              console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
-              console.log(`[+] ═══════════════════════════════════════`);
               break;
             }
           }
         }
-        if (foundCreds) break;
+
+        // Also check Gmail IMAP as secondary
+        if (!foundCreds && IMAP_CONFIG.auth.user) {
+          try {
+            const imapMessages = await checkInbox({ provider: 'gmail_imap', createdAt: new Date(Date.now() - 300000) });
+            for (const msg of imapMessages) {
+              if (msg.subject && msg.subject.toLowerCase().includes('verification code')) continue;
+              const full = await readMessage({ provider: 'gmail_imap' }, msg.id);
+              const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
+              const creds = extractCredentials(bodyText);
+              if (creds.username && creds.password) {
+                activeCreds.username = creds.username;
+                activeCreds.password = creds.password;
+                activeCreds.portalUrl = creds.portalUrl || null;
+                activeCreds.servers = creds.servers || [];
+                activeCreds.registeredAt = new Date().toISOString();
+                foundCreds = true;
+                break;
+              }
+            }
+          } catch {}
+        }
+
+        if (foundCreds) {
+          try {
+            fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2));
+          } catch (e) {
+            console.log(`[-] error saving creds to disk: ${e.message}`);
+          }
+
+          console.log(`[+] ═══════════════════════════════════════`);
+          console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
+          console.log(`[+]   username: ${activeCreds.username}`);
+          console.log(`[+]   password: ${activeCreds.password}`);
+          console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
+          console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
+          console.log(`[+] ═══════════════════════════════════════`);
+          break;
+        }
       }
-    }
 
-    const overallSuccess = success && !!activeCreds.username;
-    console.log(`[${new Date().toISOString()}] registration cycle complete (${overallSuccess ? 'SUCCESS' : 'FAILED - NO CREDS'})`);
-    return overallSuccess;
+      if (mailAccount.provider === 'simplelogin') {
+        await deleteTempMailAccount(mailAccount);
+      }
 
-  } catch (err) {
-    console.error(`[-] registration error: ${err.message}`);
-    console.error(err.stack);
-    return false;
-  } finally {
-    if (mailAccount) {
-      await deleteTempMailAccount(mailAccount);
+      const overallSuccess = formSuccess && !!activeCreds.username;
+      console.log(`[${new Date().toISOString()}] registration cycle complete (${overallSuccess ? 'SUCCESS' : 'SUBMITTED - PENDING CREDENTIALS'})`);
+      return overallSuccess;
+
+    } catch (err) {
+      console.error(`[-] registration attempt ${regAttempt} error: ${err.message}`);
+      if (mailAccount && mailAccount.provider === 'simplelogin') {
+        await deleteTempMailAccount(mailAccount);
+      }
+      await sleep(4000);
     }
   }
+
+  console.error(`[-] all registration attempts exhausted`);
+  return false;
 }
 
 // ─── IPTV proxy config & routes ───────────────────────────────────
