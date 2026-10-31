@@ -91,8 +91,8 @@ const COUNTRIES = [
 
 // exact values from WPForms field 5 select options
 const DEVICES = ['Android Box', 'Smart TV', 'Fire Tv Stick', 'Apple TV', 'Nvidia Shield', 'Formuler'];
-// exact values from WPForms field 9 select options
-const APPS = ['Iptv Smarters Pro', 'Tivimate', 'Kodi', 'OTT Player', 'GSE Smart IPTV', 'Smart IPTV'];
+// exact values from WPForms field 9 select options (Xtream Codes apps only)
+const APPS = ['Iptv Smarters Pro', 'Tivimate', 'Kodi', 'OTT Player', 'GSE Smart IPTV'];
 
 // ─── helpers ──────────────────────────────────────────────────────
 
