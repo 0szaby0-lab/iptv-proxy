@@ -693,6 +693,7 @@ async function doRegistration() {
           console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
           console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
           console.log(`[+] ═══════════════════════════════════════`);
+          console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
           break;
         }
       }
@@ -740,6 +741,7 @@ try {
       activeCreds.username = activeCreds.username.replace(/[*]/g, '').trim();
       activeCreds.password = activeCreds.password.replace(/[*]/g, '').replace(/Start.*$/i, '').trim();
       console.log(`[+] loaded saved active credentials: ${activeCreds.username}`);
+      console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
     }
   }
 } catch (e) {
@@ -1025,12 +1027,21 @@ async function syncLatestCredsFromInbox() {
                 const parsed = await simpleParser(msg.source);
                 const creds = extractCredentials(parsed.text || parsed.html || '');
                 if (creds.username && creds.password) {
+                  const mailTime = msg.envelope.date ? new Date(msg.envelope.date).getTime() : 0;
+                  const activeTime = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : 0;
+                  if (activeCreds.username && activeTime >= mailTime) {
+                    console.log(`[*] active credentials (${activeCreds.username}, ${activeCreds.registeredAt}) are newer or equal to mailbox email (${msg.envelope.date}), keeping current credentials`);
+                    lock.release();
+                    await client.logout();
+                    return true;
+                  }
                   activeCreds.username = creds.username;
                   activeCreds.password = creds.password;
                   activeCreds.portalUrl = creds.portalUrl || null;
                   activeCreds.servers = creds.servers || [];
                   activeCreds.registeredAt = msg.envelope.date ? new Date(msg.envelope.date).toISOString() : new Date().toISOString();
                   console.log(`[+] Synced latest IPTV creds from mailbox: ${activeCreds.username} (password: ${activeCreds.password})`);
+                  console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
                   try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
                   lock.release();
                   await client.logout();
