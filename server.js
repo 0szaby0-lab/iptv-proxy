@@ -628,7 +628,6 @@ async function doRegistration() {
                 }
                 activeCreds.registeredAt = new Date().toISOString();
                 foundCreds = true;
-                break;
               }
             }
           } catch (err) {
