@@ -590,12 +590,53 @@ async function doRegistration() {
         continue;
       }
 
-      console.log(`[*] waiting for IPTV credentials email (polling up to 4 minutes)...`);
-      let foundCreds = false;
-      for (let pollAttempt = 1; pollAttempt <= 16; pollAttempt++) {
-        await sleep(15000);
+      const submitCookies = [
+        ...(pageRes.cookies || []),
+        ...(submitRes.cookies || [])
+      ].map(c => c.split(';')[0]).join('; ');
 
-        // Check temp mail account inbox
+      console.log(`[*] waiting for IPTV credentials (checking REST API & inbox, up to 4 minutes)...`);
+      let foundCreds = false;
+      for (let pollAttempt = 1; pollAttempt <= 20; pollAttempt++) {
+        await sleep(12000);
+
+        // 1. Check direct trial-status REST endpoint with session cookie
+        if (submitCookies) {
+          try {
+            const trialRes = await httpRequest(`https://iptvload.org/wp-json/iptvload/v1/trial-status?_=${Date.now()}`, {
+              method: 'GET',
+              headers: {
+                'Accept': 'application/json',
+                'Cookie': submitCookies,
+                'Referer': 'https://iptvload.org/thank-you/'
+              }
+            });
+            if (trialRes.status === 200) {
+              const tData = JSON.parse(trialRes.body);
+              console.log(`[*] trial-status poll ${pollAttempt}: state=${tData.state || 'unknown'}`);
+              if (tData.state === 'ready' && tData.details && tData.details.username) {
+                console.log(`[+] received credentials directly from iptvload trial-status API!`);
+                activeCreds.username = tData.details.username;
+                activeCreds.password = tData.details.password;
+                activeCreds.portalUrl = tData.details.playlist || null;
+                activeCreds.servers = [
+                  tData.details.server_uk || 'http://cf.trial-onetvup.site',
+                  tData.details.server_other || 'http://iptvload.link'
+                ];
+                if (tData.details.server && !activeCreds.servers.includes(tData.details.server)) {
+                  activeCreds.servers.push(tData.details.server);
+                }
+                activeCreds.registeredAt = new Date().toISOString();
+                foundCreds = true;
+                break;
+              }
+            }
+          } catch (err) {
+            console.log(`[-] trial-status poll warning: ${err.message}`);
+          }
+        }
+
+        // 2. Check temp mail account inbox
         const messages = await checkInbox(mailAccount);
         if (messages && messages.length > 0) {
           for (const msg of messages) {
@@ -617,7 +658,7 @@ async function doRegistration() {
           }
         }
 
-        // Also check Gmail IMAP as secondary
+        // 3. Also check Gmail IMAP as secondary
         if (!foundCreds && IMAP_CONFIG.auth.user) {
           try {
             const imapMessages = await checkInbox({ provider: 'gmail_imap', createdAt: new Date(Date.now() - 300000) });
@@ -837,17 +878,43 @@ function getUpstreamServer() {
   return servers[0] || 'http://cf.trial-onetvup.site';
 }
 
-app.get('/', (req, res) => {
-  res.json({
+function getStatusData() {
+  const server = getUpstreamServer();
+  const registeredAtMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : null;
+  const expiresAt = registeredAtMs ? new Date(registeredAtMs + 24 * 3600 * 1000).toISOString() : null;
+  const remainingHours = registeredAtMs ? Math.max(0, ((registeredAtMs + 24 * 3600 * 1000 - Date.now()) / 3600000)).toFixed(2) : null;
+
+  return {
     status: 'running',
     service: 'iptv-proxy',
-    proxy_user: PROXY_USER,
-    has_active_trial: !!(activeCreds.username),
-    active_since: activeCreds.registeredAt,
-    servers: activeCreds.servers,
-    next_run_hours: REGISTER_INTERVAL_HOURS,
-    uptime: process.uptime()
-  });
+    proxy_auth: {
+      username: PROXY_USER,
+      password: PROXY_PASS,
+      m3u: `/get.php?username=${PROXY_USER}&password=${PROXY_PASS}&type=m3u_plus&output=ts`,
+      epg: `/xmltv.php?username=${PROXY_USER}&password=${PROXY_PASS}`
+    },
+    active_trial: {
+      username: activeCreds.username,
+      password: activeCreds.password,
+      servers: activeCreds.servers,
+      primary_server: server,
+      playlist_url: activeCreds.portalUrl || (activeCreds.username ? `${server}/get.php?username=${activeCreds.username}&password=${activeCreds.password}&type=m3u_plus&output=ts` : null),
+      epg_url: activeCreds.username ? `${server}/xmltv.php?username=${activeCreds.username}&password=${activeCreds.password}` : null,
+      registered_at: activeCreds.registeredAt,
+      expires_at: expiresAt,
+      remaining_hours: remainingHours
+    },
+    next_cycle_hours: REGISTER_INTERVAL_HOURS,
+    uptime_seconds: Math.floor(process.uptime())
+  };
+}
+
+app.get('/', (req, res) => {
+  res.json(getStatusData());
+});
+
+app.get('/status', (req, res) => {
+  res.json(getStatusData());
 });
 
 app.get('/trigger', async (req, res) => {
