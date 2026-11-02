@@ -618,14 +618,21 @@ async function doRegistration() {
                 console.log(`[+] received credentials directly from iptvload trial-status API!`);
                 activeCreds.username = tData.details.username;
                 activeCreds.password = tData.details.password;
-                activeCreds.portalUrl = tData.details.playlist || null;
-                activeCreds.servers = [
-                  tData.details.server_uk || 'http://cf.trial-onetvup.site',
-                  tData.details.server_other || 'http://iptvload.link'
-                ];
-                if (tData.details.server && !activeCreds.servers.includes(tData.details.server)) {
-                  activeCreds.servers.push(tData.details.server);
-                }
+                const serverList = [];
+                const addServer = (u) => {
+                  if (!u) return;
+                  const clean = String(u).replace(/\/$/, '').trim();
+                  if (clean && !clean.includes('trial-onetvup') && !serverList.includes(clean)) {
+                    serverList.push(clean);
+                  }
+                };
+                addServer('http://cf.iptvload.link');
+                addServer('http://pro.loadshow.link');
+                addServer(tData.details.server_other);
+                addServer(tData.details.server);
+                addServer(tData.details.server_uk);
+                if (serverList.length === 0) serverList.push('http://cf.iptvload.link', 'http://iptvload.link');
+                activeCreds.servers = serverList;
                 activeCreds.registeredAt = new Date().toISOString();
                 foundCreds = true;
               }
@@ -863,9 +870,11 @@ function checkProxyAuth(req, res) {
 }
 
 function getUpstreamServer() {
-  const servers = activeCreds.servers || [];
-  const cf = servers.find(s => s.includes('cf.') || s.includes('trial-one'));
+  const servers = (activeCreds.servers || []).filter(s => !s.includes('trial-onetvup'));
+  const cf = servers.find(s => s.includes('cf.iptvload.link'));
   if (cf) return cf;
+  const pro = servers.find(s => s.includes('pro.loadshow.link'));
+  if (pro) return pro;
   const link = servers.find(s => s.includes('iptvload.link'));
   if (link) return link;
   const bcdn = servers.find(s => s.includes('business-cdn'));
@@ -873,10 +882,12 @@ function getUpstreamServer() {
   if (activeCreds.portalUrl) {
     try {
       const parsed = new URL(activeCreds.portalUrl);
-      return `${parsed.protocol}//${parsed.host}`;
+      if (!parsed.host.includes('trial-onetvup')) {
+        return `${parsed.protocol}//${parsed.host}`;
+      }
     } catch {}
   }
-  return servers[0] || 'http://cf.trial-onetvup.site';
+  return servers[0] || 'http://cf.iptvload.link';
 }
 
 function getStatusData() {

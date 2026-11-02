@@ -1,11 +1,12 @@
 {
-  "username": "iptvload65fk",
-  "password": "01735028a6",
+  "username": "iptvloaddzoe",
+  "password": "2cf58c4c19",
   "servers": [
-    "http://cf.trial-onetvup.site",
+    "http://cf.iptvload.link",
+    "http://pro.loadshow.link",
     "http://iptvload.link",
     "http://tv.business-cdn-8k.com"
   ],
-  "portalUrl": "http://tv.business-cdn-8k.com/get.php?username=iptvload65fk&password=01735028a6&type=m3u_plus&output=ts",
-  "registeredAt": "2026-10-31T12:05:29.644Z"
+  "portalUrl": "http://cf.iptvload.link/get.php?username=iptvloaddzoe&password=2cf58c4c19&type=m3u_plus&output=ts",
+  "registeredAt": "2026-11-02T14:50:29.636Z"
 }
