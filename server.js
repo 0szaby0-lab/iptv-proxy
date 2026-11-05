@@ -658,6 +658,7 @@ async function doRegistration() {
                 addServer(tData.details.server_uk);
                 if (serverList.length === 0) serverList.push('http://cf.iptvload.link', 'http://iptvload.link');
                 activeCreds.servers = serverList;
+                activeCreds.portalUrl = `${serverList[0]}/get.php?username=${activeCreds.username}&password=${activeCreds.password}&type=m3u_plus&output=ts`;
                 activeCreds.registeredAt = new Date().toISOString();
                 foundCreds = true;
               }
