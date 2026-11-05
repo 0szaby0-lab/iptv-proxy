@@ -907,9 +907,22 @@ function proxyRequest(upstreamUrl, req, res) {
 }
 
 function getCredentials(req) {
-  const username = req.query.username || (req.body && req.body.username) || '';
-  const password = req.query.password || (req.body && req.body.password) || '';
+  let username = req.query.username || (req.body && req.body.username) || '';
+  let password = req.query.password || (req.body && req.body.password) || '';
   const action = req.query.action || (req.body && req.body.action) || '';
+
+  if (!username && req.headers.authorization && req.headers.authorization.startsWith('Basic ')) {
+    try {
+      const b64 = req.headers.authorization.split(' ')[1];
+      const decoded = Buffer.from(b64, 'base64').toString('utf8');
+      const idx = decoded.indexOf(':');
+      if (idx !== -1) {
+        username = decoded.slice(0, idx);
+        password = decoded.slice(idx + 1);
+      }
+    } catch {}
+  }
+
   return { username, password, action };
 }
 
@@ -1044,7 +1057,12 @@ async function refreshEpgCache(force = false) {
 }
 
 async function handleEpgRequest(req, res) {
-  if (!checkProxyAuth(req, res)) return;
+  const { username, password } = getCredentials(req);
+  if (username || password) {
+    if (!checkProxyAuth(req, res)) return;
+  } else if (!activeCreds.username) {
+    return res.status(503).json({ error: 'no active trial' });
+  }
 
   let meta = loadEpgMeta();
   const cacheAge = meta ? (Date.now() - meta.fetchedAt) : Infinity;
@@ -1064,18 +1082,8 @@ async function handleEpgRequest(req, res) {
     return proxyRequest(`${server}/xmltv.php?${searchParams.toString()}`, req, res);
   }
 
-  if (req.headers['if-none-match'] && req.headers['if-none-match'] === meta.etag) {
-    return res.status(304).end();
-  }
-  if (req.headers['if-modified-since']) {
-    const ifMod = new Date(req.headers['if-modified-since']).getTime();
-    if (!isNaN(ifMod) && ifMod >= meta.fetchedAt) {
-      return res.status(304).end();
-    }
-  }
-
   res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-  res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
   res.setHeader('ETag', meta.etag);
   res.setHeader('Last-Modified', meta.lastModified);
   res.setHeader('Access-Control-Allow-Origin', '*');
