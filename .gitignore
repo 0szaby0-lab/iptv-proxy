@@ -3,3 +3,5 @@ node_modules/
 .env
 active_creds.json
 *.txt
+cache/
+epg_cache*

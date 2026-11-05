@@ -1,12 +1,11 @@
 {
-  "username": "iptvloaddzoe",
-  "password": "2cf58c4c19",
+  "username": "iptvload6tm5",
+  "password": "647f0a07c3",
   "servers": [
     "http://cf.iptvload.link",
     "http://pro.loadshow.link",
-    "http://iptvload.link",
     "http://tv.business-cdn-8k.com"
   ],
-  "portalUrl": "http://cf.iptvload.link/get.php?username=iptvloaddzoe&password=2cf58c4c19&type=m3u_plus&output=ts",
-  "registeredAt": "2026-11-02T14:50:29.636Z"
+  "portalUrl": "http://cf.iptvload.link/get.php?username=iptvload6tm5&password=647f0a07c3&type=m3u_plus&output=ts",
+  "registeredAt": "2026-11-05T09:57:27.734Z"
 }

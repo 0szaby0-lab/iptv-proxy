@@ -5,6 +5,7 @@ const express = require('express');
 const cron = require('node-cron');
 const https = require('https');
 const http = require('http');
+const zlib = require('zlib');
 const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
@@ -701,6 +702,7 @@ async function doRegistration() {
           console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
           console.log(`[+] ═══════════════════════════════════════`);
           console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
+          refreshEpgCache(true);
           break;
         }
       }
@@ -826,8 +828,16 @@ function proxyRequest(upstreamUrl, req, res) {
     method: 'GET',
     headers: reqHeaders
   }, (proxyRes) => {
+    if ([301, 302, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+      const redirectUrl = new URL(proxyRes.headers.location, upstreamUrl).toString();
+      return proxyRequest(redirectUrl, req, res);
+    }
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
+  });
+
+  req.on('close', () => {
+    try { proxyReq.destroy(); } catch {}
   });
 
   proxyReq.on('error', (err) => {
@@ -890,11 +900,147 @@ function getUpstreamServer() {
   return servers[0] || 'http://cf.iptvload.link';
 }
 
+const EPG_CACHE_DIR = path.join(__dirname, 'cache');
+const EPG_CACHE_FILE = path.join(EPG_CACHE_DIR, 'epg.xml');
+const EPG_CACHE_GZ_FILE = path.join(EPG_CACHE_DIR, 'epg.xml.gz');
+const EPG_CACHE_META_FILE = path.join(EPG_CACHE_DIR, 'epg_meta.json');
+
+let epgFetchPromise = null;
+
+function loadEpgMeta() {
+  try {
+    if (fs.existsSync(EPG_CACHE_META_FILE)) {
+      return JSON.parse(fs.readFileSync(EPG_CACHE_META_FILE, 'utf8'));
+    }
+  } catch {}
+  return null;
+}
+
+async function refreshEpgCache(force = false) {
+  if (epgFetchPromise) return epgFetchPromise;
+
+  epgFetchPromise = (async () => {
+    try {
+      if (!fs.existsSync(EPG_CACHE_DIR)) {
+        fs.mkdirSync(EPG_CACHE_DIR, { recursive: true });
+      }
+
+      const meta = loadEpgMeta();
+      const now = Date.now();
+      const CACHE_MAX_AGE_MS = 3 * 3600 * 1000;
+
+      if (!force && meta && (now - meta.fetchedAt < CACHE_MAX_AGE_MS) && fs.existsSync(EPG_CACHE_FILE) && fs.existsSync(EPG_CACHE_GZ_FILE)) {
+        return meta;
+      }
+
+      const server = getUpstreamServer();
+      if (!activeCreds.username || !activeCreds.password) {
+        return meta;
+      }
+
+      const upstreamEpgUrl = `${server}/xmltv.php?username=${activeCreds.username}&password=${activeCreds.password}`;
+      console.log(`[*] refreshing EPG cache from ${server}...`);
+
+      const resp = await fetch(upstreamEpgUrl, {
+        headers: {
+          'User-Agent': 'IPTVSmartersPro/3.1.5',
+          'Accept': 'application/xml, text/xml, */*'
+        }
+      });
+
+      if (!resp.ok) {
+        console.error(`[-] EPG upstream error: HTTP ${resp.status}`);
+        return meta;
+      }
+
+      const rawBuf = Buffer.from(await resp.arrayBuffer());
+      if (rawBuf.length < 10000) {
+        console.error(`[-] EPG upstream payload too small (${rawBuf.length} bytes), ignoring`);
+        return meta;
+      }
+
+      const gzBuf = zlib.gzipSync(rawBuf, { level: 6 });
+
+      fs.writeFileSync(EPG_CACHE_FILE, rawBuf);
+      fs.writeFileSync(EPG_CACHE_GZ_FILE, gzBuf);
+
+      const newMeta = {
+        fetchedAt: now,
+        lastModified: new Date(now).toUTCString(),
+        etag: `"${now}-${rawBuf.length}"`,
+        rawSize: rawBuf.length,
+        gzSize: gzBuf.length,
+        upstreamUser: activeCreds.username
+      };
+
+      fs.writeFileSync(EPG_CACHE_META_FILE, JSON.stringify(newMeta, null, 2));
+      console.log(`[+] EPG cache updated: ${(rawBuf.length / 1048576).toFixed(1)} MB raw, ${(gzBuf.length / 1048576).toFixed(1)} MB gzip`);
+      return newMeta;
+    } catch (err) {
+      console.error(`[-] EPG cache refresh failed: ${err.message}`);
+      return loadEpgMeta();
+    } finally {
+      epgFetchPromise = null;
+    }
+  })();
+
+  return epgFetchPromise;
+}
+
+async function handleEpgRequest(req, res) {
+  if (!checkProxyAuth(req, res)) return;
+
+  let meta = loadEpgMeta();
+  const cacheAge = meta ? (Date.now() - meta.fetchedAt) : Infinity;
+
+  if (!meta || !fs.existsSync(EPG_CACHE_FILE)) {
+    meta = await refreshEpgCache(true);
+  } else if (cacheAge > 3 * 3600 * 1000) {
+    refreshEpgCache(true);
+  }
+
+  if (!meta || !fs.existsSync(EPG_CACHE_FILE)) {
+    const server = getUpstreamServer();
+    const allParams = { ...(req.query || {}), ...(req.body || {}) };
+    allParams.username = activeCreds.username;
+    allParams.password = activeCreds.password;
+    const searchParams = new URLSearchParams(allParams);
+    return proxyRequest(`${server}/xmltv.php?${searchParams.toString()}`, req, res);
+  }
+
+  if (req.headers['if-none-match'] && req.headers['if-none-match'] === meta.etag) {
+    return res.status(304).end();
+  }
+  if (req.headers['if-modified-since']) {
+    const ifMod = new Date(req.headers['if-modified-since']).getTime();
+    if (!isNaN(ifMod) && ifMod >= meta.fetchedAt) {
+      return res.status(304).end();
+    }
+  }
+
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+  res.setHeader('ETag', meta.etag);
+  res.setHeader('Last-Modified', meta.lastModified);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const acceptsGzip = (req.headers['accept-encoding'] || '').includes('gzip');
+  if (acceptsGzip && fs.existsSync(EPG_CACHE_GZ_FILE)) {
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Content-Length', meta.gzSize);
+    fs.createReadStream(EPG_CACHE_GZ_FILE).pipe(res);
+  } else {
+    res.setHeader('Content-Length', meta.rawSize);
+    fs.createReadStream(EPG_CACHE_FILE).pipe(res);
+  }
+}
+
 function getStatusData() {
   const server = getUpstreamServer();
   const registeredAtMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : null;
   const expiresAt = registeredAtMs ? new Date(registeredAtMs + 24 * 3600 * 1000).toISOString() : null;
   const remainingHours = registeredAtMs ? Math.max(0, ((registeredAtMs + 24 * 3600 * 1000 - Date.now()) / 3600000)).toFixed(2) : null;
+  const epgMeta = loadEpgMeta();
 
   return {
     status: 'running',
@@ -915,6 +1061,13 @@ function getStatusData() {
       registered_at: activeCreds.registeredAt,
       expires_at: expiresAt,
       remaining_hours: remainingHours
+    },
+    epg_cache: {
+      cached: fs.existsSync(EPG_CACHE_FILE),
+      raw_size_mb: epgMeta ? +(epgMeta.rawSize / 1048576).toFixed(2) : 0,
+      gz_size_mb: epgMeta ? +(epgMeta.gzSize / 1048576).toFixed(2) : 0,
+      last_fetched: epgMeta ? new Date(epgMeta.fetchedAt).toISOString() : null,
+      age_minutes: epgMeta ? +((Date.now() - epgMeta.fetchedAt) / 60000).toFixed(1) : null
     },
     next_cycle_hours: REGISTER_INTERVAL_HOURS,
     uptime_seconds: Math.floor(process.uptime())
@@ -956,6 +1109,12 @@ app.all('/player_api.php', async (req, res) => {
   allParams.username = activeCreds.username;
   allParams.password = activeCreds.password;
 
+  // Some IPTV apps (TiviMate, XCIPTV) send action=get_epg which iptvload fails on.
+  // Map it to get_simple_data_table so they receive the full channel program listings.
+  if (allParams.action === 'get_epg') {
+    allParams.action = 'get_simple_data_table';
+  }
+
   const searchParams = new URLSearchParams();
   for (const [k, v] of Object.entries(allParams)) {
     if (v !== undefined && v !== null) searchParams.set(k, String(v));
@@ -971,9 +1130,7 @@ app.all('/player_api.php', async (req, res) => {
       const data = await resp.json();
       if (data && data.user_info && data.server_info) {
         const proxyHost = req.get('x-forwarded-host') || req.get('host') || 'localhost';
-        const proxyProto = req.get('x-forwarded-proto') || (req.secure ? 'https' : 'http');
         const hostOnly = proxyHost.split(':')[0];
-        const portOnly = proxyHost.split(':')[1] || (proxyProto === 'https' ? '443' : '80');
 
         data.user_info.username = PROXY_USER;
         data.user_info.password = PROXY_PASS;
@@ -981,8 +1138,9 @@ app.all('/player_api.php', async (req, res) => {
         data.user_info.status = 'Active';
         data.user_info.exp_date = '2145225600';
         data.server_info.url = hostOnly;
-        data.server_info.port = portOnly;
-        data.server_info.server_protocol = proxyProto;
+        // Always report port 443 and https protocol for Render deployments
+        data.server_info.port = '443';
+        data.server_info.server_protocol = 'https';
         data.server_info.https_port = '443';
       }
       return res.json(data);
@@ -994,15 +1152,7 @@ app.all('/player_api.php', async (req, res) => {
   proxyRequest(upstreamUrl, req, res);
 });
 
-app.all('/xmltv.php', (req, res) => {
-  if (!checkProxyAuth(req, res)) return;
-  const server = getUpstreamServer();
-  const allParams = { ...(req.query || {}), ...(req.body || {}) };
-  allParams.username = activeCreds.username;
-  allParams.password = activeCreds.password;
-  const searchParams = new URLSearchParams(allParams);
-  proxyRequest(`${server}/xmltv.php?${searchParams.toString()}`, req, res);
-});
+app.all(['/xmltv.php', '/epg.xml', '/epg.php', '/xmltv', '/epg'], handleEpgRequest);
 
 app.get('/:type(live|movie|series)/:user/:pass/*', (req, res) => {
   const { type, user, pass } = req.params;
@@ -1054,6 +1204,7 @@ async function syncLatestCredsFromInbox() {
                   console.log(`[+] Synced latest IPTV creds from mailbox: ${activeCreds.username} (password: ${activeCreds.password})`);
                   console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
                   try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
+                  refreshEpgCache(true);
                   lock.release();
                   await client.logout();
                   return true;
@@ -1080,6 +1231,8 @@ async function runRegistration() {
 app.listen(PORT, async () => {
   console.log(`[*] server running on port ${PORT}`);
   await syncLatestCredsFromInbox();
+  refreshEpgCache();
+  setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
   setTimeout(() => { runRegistration(); }, 10000);
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
