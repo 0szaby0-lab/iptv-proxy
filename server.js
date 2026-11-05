@@ -97,6 +97,25 @@ const APPS = ['Iptv Smarters Pro', 'Tivimate', 'Kodi', 'OTT Player', 'GSE Smart 
 
 // ─── helpers ──────────────────────────────────────────────────────
 
+let nextRegistrationTime = null;
+
+function formatBucharestTime(date = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('hu-HU', {
+      timeZone: 'Europe/Bucharest',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }).format(date);
+  } catch {
+    return date.toISOString();
+  }
+}
+
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -699,12 +718,17 @@ async function doRegistration() {
             console.log(`[-] error saving creds to disk: ${e.message}`);
           }
 
+          const nextRun = new Date(Date.now() + REGISTER_INTERVAL_HOURS * 3600000);
+          nextRegistrationTime = nextRun;
+
           console.log(`[+] ═══════════════════════════════════════`);
           console.log(`[+] IPTV CREDENTIALS STORED FOR PROXY:`);
-          console.log(`[+]   username: ${activeCreds.username}`);
-          console.log(`[+]   password: ${activeCreds.password}`);
-          console.log(`[+]   servers:  ${activeCreds.servers.join(', ')}`);
-          console.log(`[+]   portal:   ${activeCreds.portalUrl || 'N/A'}`);
+          console.log(`[+]   username:            ${activeCreds.username}`);
+          console.log(`[+]   password:            ${activeCreds.password}`);
+          console.log(`[+]   servers:             ${activeCreds.servers.join(', ')}`);
+          console.log(`[+]   portal:              ${activeCreds.portalUrl || 'N/A'}`);
+          console.log(`[+]   regisztrálva:        ${formatBucharestTime(new Date(activeCreds.registeredAt))} (romániai idő)`);
+          console.log(`[+]   következő generálás: ${formatBucharestTime(nextRun)} (romániai idő)`);
           console.log(`[+] ═══════════════════════════════════════`);
           console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
           refreshEpgCache(true);
@@ -720,12 +744,14 @@ async function doRegistration() {
         console.log(`[${new Date().toISOString()}] registration cycle complete (SUCCESS - NEW TRIAL ACTIVATED)`);
         return true;
       } else {
+        const nextRun = nextRegistrationTime || new Date(Date.now() + REGISTER_INTERVAL_HOURS * 3600000);
         console.log(`[-] trial-status nem küldött új jelszót (pending maradt a kérés vagy időtúllépés).`);
         console.log(`[*] TOVÁBBRA IS A JELENLEGI AKTÍV FIÓK MARAD ÉRVÉNYBEN:`);
-        console.log(`[*]   username: ${activeCreds.username}`);
-        console.log(`[*]   password: ${activeCreds.password}`);
-        console.log(`[*]   servers:  ${(activeCreds.servers || []).join(', ')}`);
-        console.log(`[*]   registered: ${activeCreds.registeredAt}`);
+        console.log(`[*]   username:            ${activeCreds.username}`);
+        console.log(`[*]   password:            ${activeCreds.password}`);
+        console.log(`[*]   servers:             ${(activeCreds.servers || []).join(', ')}`);
+        console.log(`[*]   regisztrálva:        ${formatBucharestTime(new Date(activeCreds.registeredAt))} (romániai idő)`);
+        console.log(`[*]   következő generálás: ${formatBucharestTime(nextRun)} (romániai idő)`);
         console.log(`[${new Date().toISOString()}] registration cycle complete (KEPT CURRENT TRIAL)`);
         return false;
       }
@@ -1084,7 +1110,11 @@ function getStatusData() {
       last_fetched: epgMeta ? new Date(epgMeta.fetchedAt).toISOString() : null,
       age_minutes: epgMeta ? +((Date.now() - epgMeta.fetchedAt) / 60000).toFixed(1) : null
     },
-    next_cycle_hours: REGISTER_INTERVAL_HOURS,
+    next_cycle: {
+      interval_hours: REGISTER_INTERVAL_HOURS,
+      next_registration_ro_time: nextRegistrationTime ? formatBucharestTime(nextRegistrationTime) : null,
+      current_ro_time: formatBucharestTime(new Date())
+    },
     uptime_seconds: Math.floor(process.uptime())
   };
 }
@@ -1257,8 +1287,10 @@ app.listen(PORT, async () => {
   refreshEpgCache();
   setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
 
+  const initialNext = new Date(Date.now() + 5000);
+  nextRegistrationTime = initialNext;
   console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'}`);
-  console.log(`[*] azonnali új fiók regisztráció indítása 5 mp múlva...`);
+  console.log(`[*] azonnali új fiók regisztráció indítása: ${formatBucharestTime(initialNext)} (romániai idő)`);
   setTimeout(() => { runRegistration(); }, 5000);
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
