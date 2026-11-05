@@ -1257,23 +1257,8 @@ app.listen(PORT, async () => {
   refreshEpgCache();
   setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
 
-  const remaining = getRemainingTrialHours();
-  const regMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : 0;
-  const ageHours = regMs ? (Date.now() - regMs) / 3600000 : Infinity;
-
-  if (activeCreds.username && activeCreds.password && ageHours < REGISTER_INTERVAL_HOURS) {
-    const nextInMs = Math.max(10000, Math.floor((REGISTER_INTERVAL_HOURS - ageHours) * 3600000));
-    console.log(`[*] JELENLEG AKTÍV ÉS MŰKÖDŐ FIÓK:`);
-    console.log(`[*]   username: ${activeCreds.username}`);
-    console.log(`[*]   password: ${activeCreds.password}`);
-    console.log(`[*]   servers:  ${(activeCreds.servers || []).join(', ')}`);
-    console.log(`[*]   hátralévő idő: ${remaining.toFixed(1)} óra`);
-    console.log(`[*]   következő regisztráció ütemezve: ${(nextInMs / 3600000).toFixed(1)} óra múlva`);
-    setTimeout(() => { runRegistration(); }, nextInMs);
-  } else {
-    console.log(`[*] fiók lejárt vagy hiányzik, azonnali regisztráció indítása 10 mp múlva...`);
-    setTimeout(() => { runRegistration(); }, 10000);
-  }
-
+  console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'}`);
+  console.log(`[*] azonnali új fiók regisztráció indítása 5 mp múlva...`);
+  setTimeout(() => { runRegistration(); }, 5000);
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
