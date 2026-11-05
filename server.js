@@ -664,8 +664,8 @@ async function doRegistration() {
                 foundCreds = true;
               } else if (tData.state === 'pending') {
                 consecutivePending++;
-                if (consecutivePending >= 4) {
-                  console.log(`[-] trial-status elérte a 4 pending próbálkozást (beragadt ennél az emailnél). Megszakítás és új generálás...`);
+                if (consecutivePending >= 10) {
+                  console.log(`[-] trial-status elérte a 10 pending próbálkozást (túl lassú / beragadt ennél az emailnél). Megszakítás és új generálás...`);
                   break;
                 }
               }
