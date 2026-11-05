@@ -118,6 +118,7 @@ function httpRequest(url, options = {}) {
       port: parsed.port,
       path: parsed.pathname + parsed.search,
       method: options.method || 'GET',
+      timeout: options.timeout || 20000,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         ...options.headers
@@ -133,6 +134,10 @@ function httpRequest(url, options = {}) {
       }
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data, cookies: res.headers['set-cookie'] || [] }));
+    });
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`request timeout after ${reqOptions.timeout}ms`));
     });
 
     req.on('error', reject);
@@ -711,9 +716,19 @@ async function doRegistration() {
         await deleteTempMailAccount(mailAccount);
       }
 
-      const overallSuccess = formSuccess && !!activeCreds.username;
-      console.log(`[${new Date().toISOString()}] registration cycle complete (${overallSuccess ? 'SUCCESS' : 'SUBMITTED - PENDING CREDENTIALS'})`);
-      return overallSuccess;
+      if (foundCreds) {
+        console.log(`[${new Date().toISOString()}] registration cycle complete (SUCCESS - NEW TRIAL ACTIVATED)`);
+        return true;
+      } else {
+        console.log(`[-] trial-status nem küldött új jelszót (pending maradt a kérés vagy időtúllépés).`);
+        console.log(`[*] TOVÁBBRA IS A JELENLEGI AKTÍV FIÓK MARAD ÉRVÉNYBEN:`);
+        console.log(`[*]   username: ${activeCreds.username}`);
+        console.log(`[*]   password: ${activeCreds.password}`);
+        console.log(`[*]   servers:  ${(activeCreds.servers || []).join(', ')}`);
+        console.log(`[*]   registered: ${activeCreds.registeredAt}`);
+        console.log(`[${new Date().toISOString()}] registration cycle complete (KEPT CURRENT TRIAL)`);
+        return false;
+      }
 
     } catch (err) {
       console.error(`[-] registration attempt ${regAttempt} error: ${err.message}`);
@@ -1228,11 +1243,37 @@ async function runRegistration() {
   await doRegistration();
 }
 
+function getRemainingTrialHours() {
+  if (!activeCreds.registeredAt) return 0;
+  const regMs = new Date(activeCreds.registeredAt).getTime();
+  if (isNaN(regMs)) return 0;
+  const expiresMs = regMs + 24 * 3600 * 1000;
+  return Math.max(0, (expiresMs - Date.now()) / 3600000);
+}
+
 app.listen(PORT, async () => {
   console.log(`[*] server running on port ${PORT}`);
   await syncLatestCredsFromInbox();
   refreshEpgCache();
   setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
-  setTimeout(() => { runRegistration(); }, 10000);
+
+  const remaining = getRemainingTrialHours();
+  const regMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : 0;
+  const ageHours = regMs ? (Date.now() - regMs) / 3600000 : Infinity;
+
+  if (activeCreds.username && activeCreds.password && ageHours < REGISTER_INTERVAL_HOURS) {
+    const nextInMs = Math.max(10000, Math.floor((REGISTER_INTERVAL_HOURS - ageHours) * 3600000));
+    console.log(`[*] JELENLEG AKTÍV ÉS MŰKÖDŐ FIÓK:`);
+    console.log(`[*]   username: ${activeCreds.username}`);
+    console.log(`[*]   password: ${activeCreds.password}`);
+    console.log(`[*]   servers:  ${(activeCreds.servers || []).join(', ')}`);
+    console.log(`[*]   hátralévő idő: ${remaining.toFixed(1)} óra`);
+    console.log(`[*]   következő regisztráció ütemezve: ${(nextInMs / 3600000).toFixed(1)} óra múlva`);
+    setTimeout(() => { runRegistration(); }, nextInMs);
+  } else {
+    console.log(`[*] fiók lejárt vagy hiányzik, azonnali regisztráció indítása 10 mp múlva...`);
+    setTimeout(() => { runRegistration(); }, 10000);
+  }
+
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
