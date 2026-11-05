@@ -622,8 +622,9 @@ async function doRegistration() {
 
       console.log(`[*] waiting for IPTV credentials (checking REST API & inbox, up to 4 minutes)...`);
       let foundCreds = false;
+      let consecutivePending = 0;
       for (let pollAttempt = 1; pollAttempt <= 20; pollAttempt++) {
-        await sleep(12000);
+        await sleep(10000);
 
         // 1. Check direct trial-status REST endpoint with session cookie
         if (submitCookies) {
@@ -661,6 +662,12 @@ async function doRegistration() {
                 activeCreds.portalUrl = `${serverList[0]}/get.php?username=${activeCreds.username}&password=${activeCreds.password}&type=m3u_plus&output=ts`;
                 activeCreds.registeredAt = new Date().toISOString();
                 foundCreds = true;
+              } else if (tData.state === 'pending') {
+                consecutivePending++;
+                if (consecutivePending >= 4) {
+                  console.log(`[-] trial-status elérte a 4 pending próbálkozást (beragadt ennél az emailnél). Megszakítás és új generálás...`);
+                  break;
+                }
               }
             }
           } catch (err) {
@@ -737,7 +744,7 @@ async function doRegistration() {
         }
       }
 
-      if (mailAccount.provider === 'simplelogin') {
+      if (mailAccount && mailAccount.provider === 'simplelogin') {
         await deleteTempMailAccount(mailAccount);
       }
 
@@ -745,16 +752,12 @@ async function doRegistration() {
         console.log(`[${new Date().toISOString()}] registration cycle complete (SUCCESS - NEW TRIAL ACTIVATED)`);
         return true;
       } else {
-        const nextRun = nextRegistrationTime || new Date(Date.now() + REGISTER_INTERVAL_HOURS * 3600000);
-        console.log(`[-] trial-status nem küldött új jelszót (pending maradt a kérés vagy időtúllépés).`);
-        console.log(`[*] TOVÁBBRA IS A JELENLEGI AKTÍV FIÓK MARAD ÉRVÉNYBEN:`);
-        console.log(`[*]   username:            ${activeCreds.username}`);
-        console.log(`[*]   password:            ${activeCreds.password}`);
-        console.log(`[*]   servers:             ${(activeCreds.servers || []).join(', ')}`);
-        console.log(`[*]   regisztrálva:        ${formatBucharestTime(new Date(activeCreds.registeredAt))} (romániai idő)`);
-        console.log(`[*]   következő generálás: ${formatBucharestTime(nextRun)} (romániai idő)`);
-        console.log(`[${new Date().toISOString()}] registration cycle complete (KEPT CURRENT TRIAL)`);
-        return false;
+        console.log(`[-] kísérlet ${regAttempt}/8 nem adott új fiókot (pending maradt vagy nem érkezett adat).`);
+        if (regAttempt < 8) {
+          console.log(`[*] automatikusan próbálkozunk egy újabb email címmel (kísérlet ${regAttempt + 1}/8)...`);
+          await sleep(4000);
+          continue;
+        }
       }
 
     } catch (err) {
@@ -766,7 +769,18 @@ async function doRegistration() {
     }
   }
 
-  console.error(`[-] all registration attempts exhausted`);
+  console.error(`[-] all 8 registration attempts exhausted, keeping active trial`);
+  const retryMinutes = 10;
+  const retryTime = new Date(Date.now() + retryMinutes * 60000);
+  nextRegistrationTime = retryTime;
+  console.log(`[*] TOVÁBBRA IS A JELENLEGI AKTÍV FIÓK MARAD ÉRVÉNYBEN:`);
+  console.log(`[*]   username:            ${activeCreds.username}`);
+  console.log(`[*]   password:            ${activeCreds.password}`);
+  console.log(`[*]   servers:             ${(activeCreds.servers || []).join(', ')}`);
+  console.log(`[*]   regisztrálva:        ${formatBucharestTime(new Date(activeCreds.registeredAt))} (romániai idő)`);
+  console.log(`[*]   újrapróbálás (retry): ${formatBucharestTime(retryTime)} (romániai idő, ${retryMinutes} perc múlva)`);
+  console.log(`[${new Date().toISOString()}] registration cycle complete (KEPT CURRENT TRIAL)`);
+  setTimeout(() => { runRegistration(); }, retryMinutes * 60000);
   return false;
 }
 
@@ -1270,8 +1284,18 @@ async function syncLatestCredsFromInbox() {
   return false;
 }
 
+let isRegistering = false;
 async function runRegistration() {
-  await doRegistration();
+  if (isRegistering) {
+    console.log(`[*] regisztráció már folyamatban van, párhuzamos hívás kihagyva`);
+    return false;
+  }
+  isRegistering = true;
+  try {
+    return await doRegistration();
+  } finally {
+    isRegistering = false;
+  }
 }
 
 function getRemainingTrialHours() {
