@@ -471,77 +471,84 @@ async function doRegistration() {
         continue;
       }
 
-      console.log(`[+] verification code sent to ${email}!`);
+      let ivlToken = null;
 
-      let verificationCode = null;
-      const maxWaitMs = 90000;
-      const pollIntervalMs = 6000;
-      const startTime = Date.now();
+      if (sendData.bypass || sendData.token || sendData.code === 'bypass') {
+        ivlToken = sendData.token;
+        console.log(`[+] email verification bypassed by iptvload! token: ${(ivlToken || '').substring(0, 20)}...`);
+      } else {
+        console.log(`[+] verification code sent to ${email}!`);
 
-      while (Date.now() - startTime < maxWaitMs) {
-        console.log(`[*] checking inbox... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
-        await sleep(pollIntervalMs);
+        let verificationCode = null;
+        const maxWaitMs = 90000;
+        const pollIntervalMs = 6000;
+        const startTime = Date.now();
 
-        try {
-          const messages = await checkInbox(mailAccount);
-          for (const msg of messages) {
-            const subject = msg.subject || '';
-            const from = msg.from || '';
+        while (Date.now() - startTime < maxWaitMs) {
+          console.log(`[*] checking inbox... (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`);
+          await sleep(pollIntervalMs);
 
-            // check subject for 6-digit code
-            const subjectMatch = subject.match(/\b(\d{6})\b/);
-            if (subjectMatch) {
-              verificationCode = subjectMatch[1];
-              console.log(`[+] VERIFICATION CODE FROM SUBJECT: ${verificationCode}`);
-              break;
+          try {
+            const messages = await checkInbox(mailAccount);
+            for (const msg of messages) {
+              const subject = msg.subject || '';
+              const from = msg.from || '';
+
+              // check subject for 6-digit code
+              const subjectMatch = subject.match(/\b(\d{6})\b/);
+              if (subjectMatch) {
+                verificationCode = subjectMatch[1];
+                console.log(`[+] VERIFICATION CODE FROM SUBJECT: ${verificationCode}`);
+                break;
+              }
+
+              // read body for code
+              const full = await readMessage(mailAccount, msg.id);
+              const bodyText = full.body || '';
+              const codeMatch = bodyText.match(/\b(\d{6})\b/);
+              if (codeMatch) {
+                verificationCode = codeMatch[1];
+                console.log(`[+] VERIFICATION CODE FOUND IN BODY: ${verificationCode}`);
+                break;
+              }
             }
-
-            // read body for code
-            const full = await readMessage(mailAccount, msg.id);
-            const bodyText = full.body || '';
-            const codeMatch = bodyText.match(/\b(\d{6})\b/);
-            if (codeMatch) {
-              verificationCode = codeMatch[1];
-              console.log(`[+] VERIFICATION CODE FOUND IN BODY: ${verificationCode}`);
-              break;
-            }
+          } catch (err) {
+            console.log(`[-] inbox check error: ${err.message}`);
           }
-        } catch (err) {
-          console.log(`[-] inbox check error: ${err.message}`);
+
+          if (verificationCode) break;
         }
 
-        if (verificationCode) break;
+        if (!verificationCode) {
+          console.error(`[-] could not retrieve verification code within ${maxWaitMs / 1000}s, retrying with fresh email...`);
+          if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+          continue;
+        }
+
+        console.log(`[*] verifying code ${verificationCode}...`);
+        const verifyRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/verify', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Origin': 'https://iptvload.org',
+            'Referer': TARGET_URL
+          },
+          body: JSON.stringify({ form_id: 1019, email: email, code: verificationCode })
+        });
+
+        let verifyData = {};
+        try { verifyData = JSON.parse(verifyRes.body); } catch {}
+        console.log(`[*] verify response: ${JSON.stringify(verifyData)}`);
+
+        if (!verifyData.ok || !verifyData.token) {
+          console.error(`[-] verification failed: ${verifyData.message || verifyData.code}, retrying...`);
+          if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+          continue;
+        }
+
+        ivlToken = verifyData.token;
+        console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
       }
-
-      if (!verificationCode) {
-        console.error(`[-] could not retrieve verification code within ${maxWaitMs / 1000}s, retrying with fresh email...`);
-        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
-        continue;
-      }
-
-      console.log(`[*] verifying code ${verificationCode}...`);
-      const verifyRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/verify', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Origin': 'https://iptvload.org',
-          'Referer': TARGET_URL
-        },
-        body: JSON.stringify({ form_id: 1019, email: email, code: verificationCode })
-      });
-
-      let verifyData = {};
-      try { verifyData = JSON.parse(verifyRes.body); } catch {}
-      console.log(`[*] verify response: ${JSON.stringify(verifyData)}`);
-
-      if (!verifyData.ok || !verifyData.token) {
-        console.error(`[-] verification failed: ${verifyData.message || verifyData.code}, retrying...`);
-        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
-        continue;
-      }
-
-      const ivlToken = verifyData.token;
-      console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
 
       console.log(`[*] fetching registration page for tokens...`);
       const pageRes = await httpRequest(TARGET_URL);
