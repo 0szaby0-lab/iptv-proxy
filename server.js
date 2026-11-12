@@ -631,11 +631,11 @@ async function doRegistration() {
         ...(submitRes.cookies || [])
       ].map(c => c.split(';')[0]).join('; ');
 
-      console.log(`[*] waiting for IPTV credentials (checking trial-status API & inbox, up to 2 minutes)...`);
+      console.log(`[*] waiting for IPTV credentials (checking trial-status API & inbox, up to 2.5 minutes)...`);
       let foundCreds = false;
       let consecutivePending = 0;
-      for (let pollAttempt = 1; pollAttempt <= 30; pollAttempt++) {
-        await sleep(3500);
+      for (let pollAttempt = 1; pollAttempt <= 20; pollAttempt++) {
+        await sleep(7000);
 
         // 1. Check direct trial-status REST endpoint with session cookie
         if (submitCookies) {
@@ -675,11 +675,14 @@ async function doRegistration() {
                 foundCreds = true;
               } else if (tData.state === 'pending') {
                 consecutivePending++;
-                if (consecutivePending >= 25) {
-                  console.log(`[-] trial-status elérte a 25 pending próbálkozást (túl lassú / beragadt ennél az emailnél). Megszakítás és új generálás...`);
+                if (consecutivePending >= 16) {
+                  console.log(`[-] trial-status elérte a 16 pending próbálkozást (~112s, túl lassú / beragadt). Megszakítás és új generálás...`);
                   break;
                 }
               }
+            } else if (trialRes.status === 429) {
+              console.log(`[*] trial-status poll ${pollAttempt}: HTTP 429 Cloudflare rate limit hit, backing off 10s...`);
+              await sleep(10000);
             } else {
               console.log(`[*] trial-status poll ${pollAttempt}: HTTP ${trialRes.status} (${(trialRes.body || '').substring(0, 80)})`);
             }
@@ -688,8 +691,8 @@ async function doRegistration() {
           }
         }
 
-        // 2. Check temp mail account inbox periodically (every 5 polls)
-        if (!foundCreds && (pollAttempt % 5 === 0)) {
+        // 2. Check temp mail account inbox periodically (every 3 polls)
+        if (!foundCreds && (pollAttempt % 3 === 0)) {
           try {
             const messages = await checkInbox(mailAccount);
             if (messages && messages.length > 0) {
@@ -715,7 +718,7 @@ async function doRegistration() {
         }
 
         // 3. Also check Gmail IMAP if that was the registration account
-        if (!foundCreds && IMAP_CONFIG.auth.user && mailAccount && mailAccount.provider === 'gmail_imap' && (pollAttempt % 5 === 0)) {
+        if (!foundCreds && IMAP_CONFIG.auth.user && mailAccount && mailAccount.provider === 'gmail_imap' && (pollAttempt % 3 === 0)) {
           try {
             const imapMessages = await checkInbox({ provider: 'gmail_imap', createdAt: new Date(Date.now() - 300000) });
             for (const msg of imapMessages) {
