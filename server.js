@@ -45,7 +45,7 @@ app.use((req, res, next) => {
 });
 
 // ─── config ───────────────────────────────────────────────────────
-const TARGET_URL = 'https://iptvload.org/iptv-free-trial-4/';
+const TARGET_URL = 'https://iptvload.org/free-iptv-trial-24-hours/';
 const REGISTER_INTERVAL_HOURS = 20;
 
 // SimpleLogin & Gmail IMAP configuration
@@ -467,7 +467,8 @@ async function doRegistration() {
       if (!sendData.ok) {
         console.log(`[-] send failed (${sendData.code || sendRes.status}): ${sendData.message || 'unknown error'}`);
         if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
-        await sleep(3000);
+        const waitMs = (sendRes.status === 429 || sendData.code === 'limit') ? 15000 : 3000;
+        await sleep(waitMs);
         continue;
       }
 
@@ -627,11 +628,11 @@ async function doRegistration() {
         ...(submitRes.cookies || [])
       ].map(c => c.split(';')[0]).join('; ');
 
-      console.log(`[*] waiting for IPTV credentials (checking REST API & inbox, up to 4 minutes)...`);
+      console.log(`[*] waiting for IPTV credentials (checking trial-status API & inbox, up to 2 minutes)...`);
       let foundCreds = false;
       let consecutivePending = 0;
-      for (let pollAttempt = 1; pollAttempt <= 20; pollAttempt++) {
-        await sleep(10000);
+      for (let pollAttempt = 1; pollAttempt <= 30; pollAttempt++) {
+        await sleep(3500);
 
         // 1. Check direct trial-status REST endpoint with session cookie
         if (submitCookies) {
@@ -671,41 +672,47 @@ async function doRegistration() {
                 foundCreds = true;
               } else if (tData.state === 'pending') {
                 consecutivePending++;
-                if (consecutivePending >= 10) {
-                  console.log(`[-] trial-status elérte a 10 pending próbálkozást (túl lassú / beragadt ennél az emailnél). Megszakítás és új generálás...`);
+                if (consecutivePending >= 25) {
+                  console.log(`[-] trial-status elérte a 25 pending próbálkozást (túl lassú / beragadt ennél az emailnél). Megszakítás és új generálás...`);
                   break;
                 }
               }
+            } else {
+              console.log(`[*] trial-status poll ${pollAttempt}: HTTP ${trialRes.status} (${(trialRes.body || '').substring(0, 80)})`);
             }
           } catch (err) {
             console.log(`[-] trial-status poll warning: ${err.message}`);
           }
         }
 
-        // 2. Check temp mail account inbox
-        const messages = await checkInbox(mailAccount);
-        if (messages && messages.length > 0) {
-          for (const msg of messages) {
-            if (msg.subject && msg.subject.toLowerCase().includes('verification code')) continue;
-            const full = await readMessage(mailAccount, msg.id);
-            console.log(`[+] candidate email from: ${full.from || 'unknown'} | subject: ${full.subject}`);
-            const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
+        // 2. Check temp mail account inbox periodically (every 5 polls)
+        if (!foundCreds && (pollAttempt % 5 === 0)) {
+          try {
+            const messages = await checkInbox(mailAccount);
+            if (messages && messages.length > 0) {
+              for (const msg of messages) {
+                if (msg.subject && msg.subject.toLowerCase().includes('verification code')) continue;
+                const full = await readMessage(mailAccount, msg.id);
+                console.log(`[+] candidate email from: ${full.from || 'unknown'} | subject: ${full.subject}`);
+                const bodyText = (full.body || '').replace(/<[^>]+>/g, ' ');
 
-            const creds = extractCredentials(bodyText);
-            if (creds.username && creds.password) {
-              activeCreds.username = creds.username;
-              activeCreds.password = creds.password;
-              activeCreds.portalUrl = creds.portalUrl || null;
-              activeCreds.servers = creds.servers || [];
-              activeCreds.registeredAt = new Date().toISOString();
-              foundCreds = true;
-              break;
+                const creds = extractCredentials(bodyText);
+                if (creds.username && creds.password) {
+                  activeCreds.username = creds.username;
+                  activeCreds.password = creds.password;
+                  activeCreds.portalUrl = creds.portalUrl || null;
+                  activeCreds.servers = creds.servers || [];
+                  activeCreds.registeredAt = new Date().toISOString();
+                  foundCreds = true;
+                  break;
+                }
+              }
             }
-          }
+          } catch {}
         }
 
-        // 3. Also check Gmail IMAP as secondary
-        if (!foundCreds && IMAP_CONFIG.auth.user) {
+        // 3. Also check Gmail IMAP if that was the registration account
+        if (!foundCreds && IMAP_CONFIG.auth.user && mailAccount && mailAccount.provider === 'gmail_imap' && (pollAttempt % 5 === 0)) {
           try {
             const imapMessages = await checkInbox({ provider: 'gmail_imap', createdAt: new Date(Date.now() - 300000) });
             for (const msg of imapMessages) {
