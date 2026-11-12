@@ -466,9 +466,12 @@ async function doRegistration() {
 
       if (!sendData.ok) {
         console.log(`[-] send failed (${sendData.code || sendRes.status}): ${sendData.message || 'unknown error'}`);
-        if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
-        const waitMs = (sendRes.status === 429 || sendData.code === 'limit') ? 15000 : 3000;
-        await sleep(waitMs);
+        if (mailAccount && mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        if (sendRes.status === 429 || sendData.code === 'limit') {
+          console.log(`[-] iptvload ideiglenes IP limitet adott (429 / limit). Megszakítás, várakozás a feloldásra.`);
+          break;
+        }
+        await sleep(3000);
         continue;
       }
 
@@ -1334,10 +1337,17 @@ app.listen(PORT, async () => {
   refreshEpgCache();
   setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
 
-  const initialNext = new Date(Date.now() + 5000);
-  nextRegistrationTime = initialNext;
-  console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'}`);
-  console.log(`[*] azonnali új fiók regisztráció indítása: ${formatBucharestTime(initialNext)} (romániai idő)`);
-  setTimeout(() => { runRegistration(); }, 5000);
+  const remaining = getRemainingTrialHours();
+  console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'} (${remaining.toFixed(1)} óra van még hátra)`);
+  if (remaining < 2) {
+    const initialNext = new Date(Date.now() + 5000);
+    nextRegistrationTime = initialNext;
+    console.log(`[*] a fiók lejárt vagy 2 órán belül lejár, azonnali új fiók regisztráció indítása: ${formatBucharestTime(initialNext)} (romániai idő)`);
+    setTimeout(() => { runRegistration(); }, 5000);
+  } else {
+    const nextRun = new Date(Date.now() + Math.min(REGISTER_INTERVAL_HOURS, Math.max(1, remaining - 1)) * 3600000);
+    nextRegistrationTime = nextRun;
+    console.log(`[*] a betöltött fiók érvényes, következő tervezett generálás: ${formatBucharestTime(nextRun)} (romániai idő)`);
+  }
   setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
 });
