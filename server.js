@@ -49,8 +49,9 @@ const TARGET_URL = 'https://iptvload.org/free-iptv-trial-24-hours/';
 const REGISTER_INTERVAL_HOURS = 20;
 
 // SolverCF Turnstile solver — comma-separated keys, auto-rotates on balance/error
-const SOLVERCF_API_KEYS = (process.env.SOLVERCF_API_KEYS || process.env.SOLVERCF_API_KEY || '7d562a47-8eb7-46bd-8d38-629658990778')
+const SOLVERCF_API_KEYS = (process.env.SOLVERCF_API_KEYS || '')
   .split(',').map(k => k.trim()).filter(Boolean);
+if (!SOLVERCF_API_KEYS.length) console.error('[!] WARNING: SOLVERCF_API_KEYS env var not set — Turnstile solving will fail!');
 let solverKeyIndex = 0;
 const TURNSTILE_SITEKEY = '0x4AAAAAAGBN3ovuTvtx0lnr';
 
