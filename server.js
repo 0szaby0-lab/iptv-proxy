@@ -46,7 +46,7 @@ app.use((req, res, next) => {
 
 // ─── config ───────────────────────────────────────────────────────
 const TARGET_URL = 'https://iptvload.org/free-iptv-trial-24-hours/';
-const REGISTER_INTERVAL_HOURS = 20;
+const REGISTER_INTERVAL_HOURS = parseInt(process.env.REGISTER_INTERVAL_HOURS, 10) || 22;
 
 // SolverCF Turnstile solver — comma-separated keys, auto-rotates on balance/error
 const SOLVERCF_API_KEYS = (process.env.SOLVERCF_API_KEYS || '')
@@ -735,14 +735,17 @@ async function doRegistration() {
         ...(submitRes.cookies || [])
       ].map(c => c.split(';')[0]).join('; ');
 
-      console.log(`[*] waiting for IPTV credentials (checking trial-status API & inbox, up to 2.5 minutes)...`);
+      console.log(`[*] waiting for IPTV credentials (checking trial-status API & inbox, up to 3.5 minutes)...`);
       let foundCreds = false;
       let consecutivePending = 0;
-      for (let pollAttempt = 1; pollAttempt <= 20; pollAttempt++) {
-        await sleep(7000);
+      let consecutive429 = 0;
+      let skipTrialStatus = false;
+
+      for (let pollAttempt = 1; pollAttempt <= 16; pollAttempt++) {
+        await sleep(12000);
 
         // 1. Check direct trial-status REST endpoint with session cookie
-        if (submitCookies) {
+        if (submitCookies && !skipTrialStatus) {
           try {
             const trialRes = await httpRequest(`https://iptvload.org/wp-json/iptvload/v1/trial-status?_=${Date.now()}`, {
               method: 'GET',
@@ -753,6 +756,7 @@ async function doRegistration() {
               }
             });
             if (trialRes.status === 200) {
+              consecutive429 = 0;
               const tData = JSON.parse(trialRes.body);
               console.log(`[*] trial-status poll ${pollAttempt}: state=${tData.state || 'unknown'}`);
               if (tData.state === 'ready' && tData.details && tData.details.username) {
@@ -779,14 +783,20 @@ async function doRegistration() {
                 foundCreds = true;
               } else if (tData.state === 'pending') {
                 consecutivePending++;
-                if (consecutivePending >= 16) {
-                  console.log(`[-] trial-status elérte a 16 pending próbálkozást (~112s, túl lassú / beragadt). Megszakítás és új generálás...`);
+                if (consecutivePending >= 12) {
+                  console.log(`[-] trial-status elérte a 12 pending próbálkozást (~144s, túl lassú / beragadt). Megszakítás és új generálás...`);
                   break;
                 }
               }
             } else if (trialRes.status === 429) {
-              console.log(`[*] trial-status poll ${pollAttempt}: HTTP 429 Cloudflare rate limit hit, backing off 10s...`);
-              await sleep(10000);
+              consecutive429++;
+              if (consecutive429 >= 2) {
+                console.log(`[*] trial-status: 2x HTTP 429 Cloudflare rate limit. API lekérdezés leállítva, átváltás közvetlen email lekérdezésre az IP tiltás elkerülésére.`);
+                skipTrialStatus = true;
+              } else {
+                console.log(`[*] trial-status poll ${pollAttempt}: HTTP 429 Cloudflare rate limit hit, backing off 15s...`);
+                await sleep(15000);
+              }
             } else {
               console.log(`[*] trial-status poll ${pollAttempt}: HTTP ${trialRes.status} (${(trialRes.body || '').substring(0, 80)})`);
             }
@@ -795,8 +805,8 @@ async function doRegistration() {
           }
         }
 
-        // 2. Check temp mail account inbox periodically (every 3 polls)
-        if (!foundCreds && (pollAttempt % 3 === 0)) {
+        // 2. Check temp mail account inbox periodically (or every poll if trial-status is skipped/limited)
+        if (!foundCreds && (skipTrialStatus || (pollAttempt % 2 === 0))) {
           try {
             const messages = await checkInbox(mailAccount);
             if (messages && messages.length > 0) {
