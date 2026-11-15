@@ -1179,6 +1179,59 @@ app.get('/trigger', async (req, res) => {
   runRegistration();
 });
 
+app.get('/update', (req, res) => {
+  const { user, pass } = req.query;
+  if (user && pass) {
+    const cleanUser = String(user).trim();
+    const cleanPass = String(pass).trim();
+    activeCreds.username = cleanUser;
+    activeCreds.password = cleanPass;
+    const srv = (activeCreds.servers && activeCreds.servers[0]) || 'http://cf.iptvload.link';
+    activeCreds.portalUrl = `${srv}/get.php?username=${cleanUser}&password=${cleanPass}&type=m3u_plus&output=ts`;
+    activeCreds.registeredAt = new Date().toISOString();
+    try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
+    refreshEpgCache(true);
+    return res.send(`<h2>Sikeresen frissitve!</h2><p>Aktiv fiok: <b>${cleanUser}</b></p><p>A TV mostantol ezt hasznalja.</p><p><a href="/status">Status megtekintese</a></p>`);
+  }
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>IPTV Proxy - Fiok Frissites</title>
+      <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: #1e1e1e; padding: 25px; border-radius: 12px; width: 100%; max-width: 380px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        h2 { margin-top: 0; font-size: 20px; color: #00e676; }
+        label { display: block; margin: 12px 0 4px; font-size: 14px; color: #aaa; }
+        input { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #333; background: #2a2a2a; color: #fff; box-sizing: border-box; font-size: 15px; }
+        button { width: 100%; padding: 12px; margin-top: 20px; background: #00e676; color: #000; border: none; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .curr { margin-top: 20px; padding: 10px; background: #262626; border-radius: 6px; font-size: 13px; color: #888; }
+        .curr b { color: #fff; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2>IPTV Fiok Frissites</h2>
+        <form method="GET" action="/update">
+          <label>Username</label>
+          <input type="text" name="user" placeholder="pl. iptvload..." required autofocus>
+          <label>Password</label>
+          <input type="text" name="pass" placeholder="jelszo" required>
+          <button type="submit">Aktivalas a TV-n</button>
+        </form>
+        <div class="curr">
+          Jelenlegi fiok: <b>${activeCreds.username || 'nincs'}</b><br>
+          Regisztralva: <b>${activeCreds.registeredAt || '-'}</b>
+        </div>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
 app.get('/logs', (req, res) => {
   res.type('text/plain').send(runtimeLogs.join('\n'));
 });
