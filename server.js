@@ -48,8 +48,10 @@ app.use((req, res, next) => {
 const TARGET_URL = 'https://iptvload.org/free-iptv-trial-24-hours/';
 const REGISTER_INTERVAL_HOURS = 20;
 
-// SolverCF Turnstile solver
-const SOLVERCF_API_KEY = process.env.SOLVERCF_API_KEY || '7d562a47-8eb7-46bd-8d38-629658990778';
+// SolverCF Turnstile solver — comma-separated keys, auto-rotates on balance/error
+const SOLVERCF_API_KEYS = (process.env.SOLVERCF_API_KEYS || process.env.SOLVERCF_API_KEY || '7d562a47-8eb7-46bd-8d38-629658990778')
+  .split(',').map(k => k.trim()).filter(Boolean);
+let solverKeyIndex = 0;
 const TURNSTILE_SITEKEY = '0x4AAAAAAGBN3ovuTvtx0lnr';
 
 // SimpleLogin & Gmail IMAP configuration
@@ -171,13 +173,13 @@ function httpRequest(url, options = {}) {
 
 // ─── turnstile solver (SolverCF) ──────────────────────────────────
 
-async function solveTurnstile() {
-  console.log(`[*] Turnstile: creating solve task...`);
+async function solveTurnstileWithKey(apiKey) {
+  console.log(`[*] Turnstile: creating solve task (key: ...${apiKey.slice(-8)})...`);
   const createRes = await httpRequest('https://solvercf.com/token/extension/createTask', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      clientKey: SOLVERCF_API_KEY,
+      clientKey: apiKey,
       task: {
         type: 'TurnstileTask',
         websiteUrl: TARGET_URL,
@@ -201,7 +203,7 @@ async function solveTurnstile() {
     const pollRes = await httpRequest('https://solvercf.com/token/extension/getTaskResult', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clientKey: SOLVERCF_API_KEY, taskId })
+      body: JSON.stringify({ clientKey: apiKey, taskId })
     });
 
     const pollData = JSON.parse(pollRes.body);
@@ -212,11 +214,34 @@ async function solveTurnstile() {
     }
 
     if (pollData.status === 'failed' || pollData.status === 'expired') {
-      throw new Error(`SolverCF task ${pollData.status}`);
+      throw new Error(`SolverCF task ${pollData.status}: ${pollData.errorDescription || ''}`);
     }
   }
 
   throw new Error('SolverCF: turnstile solve timed out (90s)');
+}
+
+async function solveTurnstile() {
+  const startIdx = solverKeyIndex;
+  for (let i = 0; i < SOLVERCF_API_KEYS.length; i++) {
+    const idx = (startIdx + i) % SOLVERCF_API_KEYS.length;
+    const key = SOLVERCF_API_KEYS[idx];
+    try {
+      const solution = await solveTurnstileWithKey(key);
+      solverKeyIndex = idx; // stick with working key
+      return solution;
+    } catch (err) {
+      const isBalanceErr = err.message.includes('not enough') || err.message.includes('balance');
+      console.log(`[-] Turnstile key ...${key.slice(-8)} failed: ${err.message}`);
+      if (isBalanceErr && SOLVERCF_API_KEYS.length > 1) {
+        console.log(`[*] Turnstile: rotating to next API key...`);
+        solverKeyIndex = (idx + 1) % SOLVERCF_API_KEYS.length;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('SolverCF: all API keys exhausted (no balance)');
 }
 
 // ─── temp email (Emailnator API + Gmail IMAP fallback) ───────────
