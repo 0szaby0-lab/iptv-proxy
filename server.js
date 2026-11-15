@@ -471,6 +471,10 @@ async function doRegistration() {
           console.log(`[-] iptvload ideiglenes IP limitet adott (429 / limit). Megszakítás, várakozás a feloldásra.`);
           break;
         }
+        if (sendData.code === 'captcha') {
+          console.log(`[-] iptvload Cloudflare Turnstile ellenőrzést kér (captcha). Megszakítás.`);
+          break;
+        }
         await sleep(3000);
         continue;
       }
