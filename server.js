@@ -925,11 +925,15 @@ const PROXY_PASS = process.env.PROXY_PASS || '2002';
 const CREDS_FILE = path.join(__dirname, 'active_creds.json');
 
 let activeCreds = {
-  username: null,
-  password: null,
-  servers: [],
-  portalUrl: null,
-  registeredAt: null
+  username: 'iptvloadj47n',
+  password: 'ec062a7161',
+  servers: [
+    'http://cf.iptvload.link',
+    'http://pro.loadshow.link',
+    'http://tv.business-cdn-8k.com'
+  ],
+  portalUrl: 'http://cf.iptvload.link/get.php?username=iptvloadj47n&password=ec062a7161&type=m3u_plus&output=ts',
+  registeredAt: '2026-11-15T22:26:50.710Z'
 };
 
 try {
