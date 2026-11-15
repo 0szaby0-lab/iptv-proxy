@@ -48,6 +48,10 @@ app.use((req, res, next) => {
 const TARGET_URL = 'https://iptvload.org/free-iptv-trial-24-hours/';
 const REGISTER_INTERVAL_HOURS = 20;
 
+// SolverCF Turnstile solver
+const SOLVERCF_API_KEY = process.env.SOLVERCF_API_KEY || '7d562a47-8eb7-46bd-8d38-629658990778';
+const TURNSTILE_SITEKEY = '0x4AAAAAAGBN3ovuTvtx0lnr';
+
 // SimpleLogin & Gmail IMAP configuration
 const SIMPLELOGIN_API = process.env.SIMPLELOGIN_API || 'https://app.simplelogin.io';
 const SIMPLELOGIN_API_KEY = process.env.SIMPLELOGIN_API_KEY;
@@ -163,6 +167,56 @@ function httpRequest(url, options = {}) {
     if (options.body) req.write(options.body);
     req.end();
   });
+}
+
+// ─── turnstile solver (SolverCF) ──────────────────────────────────
+
+async function solveTurnstile() {
+  console.log(`[*] Turnstile: creating solve task...`);
+  const createRes = await httpRequest('https://solvercf.com/token/extension/createTask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      clientKey: SOLVERCF_API_KEY,
+      task: {
+        type: 'TurnstileTask',
+        websiteUrl: TARGET_URL,
+        websiteKey: TURNSTILE_SITEKEY
+      }
+    })
+  });
+
+  const createData = JSON.parse(createRes.body);
+  if (createData.errorId === 1) {
+    throw new Error(`SolverCF createTask failed: ${createData.errorDescription || JSON.stringify(createData)}`);
+  }
+
+  const taskId = createData.taskId;
+  console.log(`[+] Turnstile: task created: ${taskId}`);
+
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+
+    const pollRes = await httpRequest('https://solvercf.com/token/extension/getTaskResult', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientKey: SOLVERCF_API_KEY, taskId })
+    });
+
+    const pollData = JSON.parse(pollRes.body);
+
+    if (pollData.status === 'ready') {
+      console.log(`[+] Turnstile: solved! token: ${pollData.solution.token.substring(0, 40)}...`);
+      return pollData.solution;
+    }
+
+    if (pollData.status === 'failed' || pollData.status === 'expired') {
+      throw new Error(`SolverCF task ${pollData.status}`);
+    }
+  }
+
+  throw new Error('SolverCF: turnstile solve timed out (90s)');
 }
 
 // ─── temp email (Emailnator API + Gmail IMAP fallback) ───────────
@@ -450,13 +504,32 @@ async function doRegistration() {
       console.log(`[+] app: ${iptv_app}`);
 
       console.log(`[*] requesting email verification code...`);
+
+      // solve Cloudflare Turnstile via SolverCF
+      let turnstileSolution = null;
+      try {
+        turnstileSolution = await solveTurnstile();
+      } catch (tsErr) {
+        console.log(`[-] Turnstile solve failed: ${tsErr.message}`);
+        if (mailAccount && mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
+        await sleep(3000);
+        continue;
+      }
+
+      const sendHeaders = {
+        'Content-Type': 'application/json',
+        'Origin': 'https://iptvload.org',
+        'Referer': TARGET_URL,
+        'X-IVL-TS': turnstileSolution.token
+      };
+      // use the user-agent that the solver used (Cloudflare validates it)
+      if (turnstileSolution.userAgent) {
+        sendHeaders['User-Agent'] = turnstileSolution.userAgent;
+      }
+
       let sendRes = await httpRequest('https://iptvload.org/wp-json/ivl/v1/send', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Origin': 'https://iptvload.org',
-          'Referer': TARGET_URL
-        },
+        headers: sendHeaders,
         body: JSON.stringify({ form_id: 1019, email: email })
       });
 
@@ -472,8 +545,9 @@ async function doRegistration() {
           break;
         }
         if (sendData.code === 'captcha') {
-          console.log(`[-] iptvload Cloudflare Turnstile ellenőrzést kér (captcha). Megszakítás.`);
-          break;
+          console.log(`[-] iptvload Turnstile token elutasítva, újrapróbálás új tokennel...`);
+          await sleep(3000);
+          continue;
         }
         await sleep(3000);
         continue;
