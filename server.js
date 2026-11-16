@@ -6,6 +6,7 @@ const cron = require('node-cron');
 const https = require('https');
 const http = require('http');
 const zlib = require('zlib');
+const crypto = require('crypto');
 const { URL } = require('url');
 const fs = require('fs');
 const path = require('path');
@@ -874,6 +875,7 @@ async function doRegistration() {
           console.log(`[+] ═══════════════════════════════════════`);
           console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
           refreshEpgCache(true);
+          refreshM3uCache(true);
           break;
         }
       }
@@ -1107,6 +1109,9 @@ const EPG_CACHE_DIR = path.join(__dirname, 'cache');
 const EPG_CACHE_FILE = path.join(EPG_CACHE_DIR, 'epg.xml');
 const EPG_CACHE_GZ_FILE = path.join(EPG_CACHE_DIR, 'epg.xml.gz');
 const EPG_CACHE_META_FILE = path.join(EPG_CACHE_DIR, 'epg_meta.json');
+const M3U_CACHE_FILE = path.join(EPG_CACHE_DIR, 'playlist.m3u');
+const M3U_CACHE_GZ_FILE = path.join(EPG_CACHE_DIR, 'playlist.m3u.gz');
+const M3U_CACHE_META_FILE = path.join(EPG_CACHE_DIR, 'm3u_meta.json');
 
 let epgFetchPromise = null;
 
@@ -1233,12 +1238,170 @@ async function handleEpgRequest(req, res) {
   }
 }
 
+let m3uFetchPromise = null;
+
+function loadM3uMeta() {
+  try {
+    if (fs.existsSync(M3U_CACHE_META_FILE)) {
+      return JSON.parse(fs.readFileSync(M3U_CACHE_META_FILE, 'utf8'));
+    }
+  } catch {}
+  return null;
+}
+
+async function refreshM3uCache(force = false, reqHost = null) {
+  if (m3uFetchPromise) return m3uFetchPromise;
+
+  m3uFetchPromise = (async () => {
+    try {
+      if (!fs.existsSync(EPG_CACHE_DIR)) {
+        fs.mkdirSync(EPG_CACHE_DIR, { recursive: true });
+      }
+
+      const meta = loadM3uMeta();
+      const now = Date.now();
+      const CACHE_MAX_AGE_MS = 6 * 3600 * 1000;
+
+      if (!force && meta && (now - meta.fetchedAt < CACHE_MAX_AGE_MS) && fs.existsSync(M3U_CACHE_FILE)) {
+        return meta;
+      }
+
+      const server = getUpstreamServer();
+      if (!activeCreds.username || !activeCreds.password) {
+        return meta;
+      }
+
+      console.log(`[*] refreshing M3U cache from ${server}...`);
+
+      const catUrl = `${server}/player_api.php?username=${activeCreds.username}&password=${activeCreds.password}&action=get_live_categories`;
+      const streamUrl = `${server}/player_api.php?username=${activeCreds.username}&password=${activeCreds.password}&action=get_live_streams`;
+
+      const [catResp, streamResp] = await Promise.all([
+        fetch(catUrl, { headers: { 'User-Agent': 'IPTVSmartersPro/3.1.5' } }),
+        fetch(streamUrl, { headers: { 'User-Agent': 'IPTVSmartersPro/3.1.5' } })
+      ]);
+
+      if (!catResp.ok || !streamResp.ok) {
+        console.error(`[-] M3U upstream error: cat ${catResp.status}, streams ${streamResp.status}`);
+        return meta;
+      }
+
+      const [catData, streamData] = await Promise.all([
+        catResp.json(),
+        streamResp.json()
+      ]);
+
+      if (!Array.isArray(streamData) || streamData.length === 0) {
+        console.error(`[-] M3U upstream returned empty streams`);
+        return meta;
+      }
+
+      const categoryMap = {};
+      if (Array.isArray(catData)) {
+        for (const c of catData) {
+          if (c && c.category_id) categoryMap[String(c.category_id)] = c.category_name || '';
+        }
+      }
+
+      const host = reqHost || 'iptv-proxy-qyc0.onrender.com';
+      const proto = host.includes('localhost') ? 'http' : 'https';
+      const baseUrl = `${proto}://${host}`;
+
+      const lines = [
+        `#EXTM3U x-tvg-url="${baseUrl}/xmltv.php?username=${PROXY_USER}&password=${PROXY_PASS}"`
+      ];
+
+      for (const s of streamData) {
+        if (!s || !s.stream_id) continue;
+        const name = (s.name || '').replace(/[\r\n]/g, ' ');
+        const logo = s.stream_icon || '';
+        const epgId = s.epg_channel_id || '';
+        const cat = categoryMap[String(s.category_id)] || '';
+        lines.push(`#EXTINF:-1 tvg-id="${epgId}" tvg-name="${name}" tvg-logo="${logo}" group-title="${cat}",${name}`);
+        lines.push(`${baseUrl}/live/${PROXY_USER}/${PROXY_PASS}/${s.stream_id}.ts`);
+      }
+
+      const rawContent = lines.join('\n');
+      const rawBuf = Buffer.from(rawContent, 'utf8');
+      const gzBuf = zlib.gzipSync(rawBuf);
+
+      fs.writeFileSync(M3U_CACHE_FILE, rawBuf);
+      fs.writeFileSync(M3U_CACHE_GZ_FILE, gzBuf);
+
+      const newMeta = {
+        fetchedAt: now,
+        rawSize: rawBuf.length,
+        gzSize: gzBuf.length,
+        streamsCount: streamData.length,
+        etag: `"${crypto.createHash('md5').update(rawBuf).digest('hex')}"`,
+        lastModified: new Date(now).toUTCString()
+      };
+
+      fs.writeFileSync(M3U_CACHE_META_FILE, JSON.stringify(newMeta, null, 2));
+      console.log(`[+] M3U cache updated: ${(rawBuf.length / 1024 / 1024).toFixed(1)} MB (${streamData.length} channels)`);
+      return newMeta;
+    } catch (err) {
+      console.error(`[-] M3U cache refresh error: ${err.message}`);
+    } finally {
+      m3uFetchPromise = null;
+    }
+  })();
+
+  return m3uFetchPromise;
+}
+
+async function handleM3uRequest(req, res) {
+  const { username, password } = getCredentials(req);
+  if (username || password) {
+    if (!checkProxyAuth(req, res)) return;
+  } else if (!activeCreds.username) {
+    return res.status(503).json({ error: 'no active trial' });
+  }
+
+  const reqHost = req.get('x-forwarded-host') || req.get('host') || 'iptv-proxy-qyc0.onrender.com';
+  let meta = loadM3uMeta();
+  const cacheAge = meta ? (Date.now() - meta.fetchedAt) : Infinity;
+
+  if (!meta || !fs.existsSync(M3U_CACHE_FILE)) {
+    meta = await refreshM3uCache(true, reqHost);
+  } else if (cacheAge > 6 * 3600 * 1000) {
+    refreshM3uCache(true, reqHost);
+  }
+
+  if (!meta || !fs.existsSync(M3U_CACHE_FILE)) {
+    const server = getUpstreamServer();
+    const allParams = { ...(req.query || {}), ...(req.body || {}) };
+    allParams.username = activeCreds.username;
+    allParams.password = activeCreds.password;
+    const searchParams = new URLSearchParams(allParams);
+    return proxyRequest(`${server}/get.php?${searchParams.toString()}`, req, res);
+  }
+
+  res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
+  res.setHeader('Content-Disposition', 'inline; filename="playlist.m3u"');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('ETag', meta.etag);
+  res.setHeader('Last-Modified', meta.lastModified);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const acceptsGzip = (req.headers['accept-encoding'] || '').includes('gzip');
+  if (acceptsGzip && fs.existsSync(M3U_CACHE_GZ_FILE)) {
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Content-Length', meta.gzSize);
+    fs.createReadStream(M3U_CACHE_GZ_FILE).pipe(res);
+  } else {
+    res.setHeader('Content-Length', meta.rawSize);
+    fs.createReadStream(M3U_CACHE_FILE).pipe(res);
+  }
+}
+
 function getStatusData() {
   const server = getUpstreamServer();
   const registeredAtMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : null;
   const expiresAt = registeredAtMs ? new Date(registeredAtMs + 24 * 3600 * 1000).toISOString() : null;
   const remainingHours = registeredAtMs ? Math.max(0, ((registeredAtMs + 24 * 3600 * 1000 - Date.now()) / 3600000)).toFixed(2) : null;
   const epgMeta = loadEpgMeta();
+  const m3uMeta = loadM3uMeta();
 
   return {
     status: 'running',
@@ -1247,6 +1410,7 @@ function getStatusData() {
       username: PROXY_USER,
       password: PROXY_PASS,
       m3u: `/get.php?username=${PROXY_USER}&password=${PROXY_PASS}&type=m3u_plus&output=ts`,
+      m3u_clean: `/playlist.m3u`,
       epg: `/xmltv.php?username=${PROXY_USER}&password=${PROXY_PASS}`
     },
     active_trial: {
@@ -1266,6 +1430,14 @@ function getStatusData() {
       gz_size_mb: epgMeta ? +(epgMeta.gzSize / 1048576).toFixed(2) : 0,
       last_fetched: epgMeta ? new Date(epgMeta.fetchedAt).toISOString() : null,
       age_minutes: epgMeta ? +((Date.now() - epgMeta.fetchedAt) / 60000).toFixed(1) : null
+    },
+    m3u_cache: {
+      cached: fs.existsSync(M3U_CACHE_FILE),
+      raw_size_mb: m3uMeta ? +(m3uMeta.rawSize / 1048576).toFixed(2) : 0,
+      gz_size_mb: m3uMeta ? +(m3uMeta.gzSize / 1048576).toFixed(2) : 0,
+      channels_count: m3uMeta ? m3uMeta.streamsCount : 0,
+      last_fetched: m3uMeta ? new Date(m3uMeta.fetchedAt).toISOString() : null,
+      age_minutes: m3uMeta ? +((Date.now() - m3uMeta.fetchedAt) / 60000).toFixed(1) : null
     },
     next_cycle: {
       interval_hours: REGISTER_INTERVAL_HOURS,
@@ -1301,6 +1473,7 @@ app.get('/update', (req, res) => {
     activeCreds.registeredAt = new Date().toISOString();
     try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
     refreshEpgCache(true);
+    refreshM3uCache(true);
     return res.send(`<h2>Sikeresen frissitve!</h2><p>Aktiv fiok: <b>${cleanUser}</b></p><p>A TV mostantol ezt hasznalja.</p><p><a href="/status">Status megtekintese</a></p>`);
   }
 
@@ -1346,15 +1519,7 @@ app.get('/logs', (req, res) => {
   res.type('text/plain').send(runtimeLogs.join('\n'));
 });
 
-app.all('/get.php', (req, res) => {
-  if (!checkProxyAuth(req, res)) return;
-  const server = getUpstreamServer();
-  const allParams = { ...(req.query || {}), ...(req.body || {}) };
-  allParams.username = activeCreds.username;
-  allParams.password = activeCreds.password;
-  const searchParams = new URLSearchParams(allParams);
-  proxyRequest(`${server}/get.php?${searchParams.toString()}`, req, res);
-});
+app.all(['/get.php', '/playlist.m3u', '/playlist.m3u8', '/channels.m3u', '/channels.m3u8'], handleM3uRequest);
 
 app.all('/player_api.php', async (req, res) => {
   if (!checkProxyAuth(req, res)) return;
@@ -1460,6 +1625,7 @@ async function syncLatestCredsFromInbox() {
                   console.log(`[+] ACTIVE CREDENTIALS JSON:\n${JSON.stringify(activeCreds, null, 2)}`);
                   try { fs.writeFileSync(CREDS_FILE, JSON.stringify(activeCreds, null, 2)); } catch {}
                   refreshEpgCache(true);
+                  refreshM3uCache(true);
                   lock.release();
                   await client.logout();
                   return true;
@@ -1506,6 +1672,8 @@ app.listen(PORT, async () => {
   await syncLatestCredsFromInbox();
   refreshEpgCache();
   setInterval(() => { refreshEpgCache(true); }, 3 * 3600000);
+  refreshM3uCache();
+  setInterval(() => { refreshM3uCache(true); }, 4 * 3600000);
 
   const remaining = getRemainingTrialHours();
   console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'} (${remaining.toFixed(1)} óra van még hátra)`);
