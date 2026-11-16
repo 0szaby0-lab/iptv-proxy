@@ -248,10 +248,13 @@ async function solveTurnstile() {
 
 // ─── temp email (Emailnator API + Gmail IMAP fallback) ───────────
 
+const knownUsedEmails = new Set();
+
 async function generateEmailnatorAccount() {
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 6; attempt++) {
     try {
-      console.log(`[*] Emailnator GoogleMail generation attempt ${attempt}/5...`);
+      console.log(`[*] Emailnator Gmail generation attempt ${attempt}/6...`);
+      // ids: 2 = plus gmail, 3 = dot gmail, 8 = googlemail (huge pool of fresh addresses)
       const res = await httpRequest('https://www.emailnator.com/api/generate-email', {
         method: 'POST',
         headers: {
@@ -260,13 +263,17 @@ async function generateEmailnatorAccount() {
           'Origin': 'https://www.emailnator.com',
           'Referer': 'https://www.emailnator.com/'
         },
-        body: JSON.stringify({ ids: [8] })
+        body: JSON.stringify({ ids: [2, 3, 8] })
       });
 
       if (res.status === 200) {
         const data = JSON.parse(res.body);
         if (data.status === 'success' && data.email) {
-          console.log(`[+] Emailnator GoogleMail generated: ${data.email}`);
+          if (knownUsedEmails.has(data.email)) {
+            console.log(`[-] Emailnator address ${data.email} is in known-used list, skipping...`);
+            continue;
+          }
+          console.log(`[+] Emailnator Gmail generated: ${data.email} (type: ${data.email_type_id || 'unknown'})`);
           return {
             provider: 'emailnator',
             address: data.email,
@@ -279,7 +286,7 @@ async function generateEmailnatorAccount() {
     } catch (err) {
       console.log(`[-] Emailnator attempt ${attempt} error: ${err.message}`);
     }
-    await sleep(2500 * attempt);
+    await sleep(1500 * attempt);
   }
   return null;
 }
@@ -341,9 +348,40 @@ async function readEmailnatorMessage(msgId) {
   return { from: '', subject: '', body: '' };
 }
 
-async function createTempMailAccount() {
-  const emailnatorAcc = await generateEmailnatorAccount();
-  if (emailnatorAcc) return emailnatorAcc;
+function generateDotGmail(userBase, domain = 'gmail.com') {
+  if (!userBase || userBase.length < 2) return `${userBase}@${domain}`;
+  let result = userBase[0];
+  let dotCount = 0;
+  for (let i = 1; i < userBase.length; i++) {
+    if (Math.random() < 0.5 && !result.endsWith('.')) {
+      result += '.';
+      dotCount++;
+    }
+    result += userBase[i];
+  }
+  if (dotCount === 0) {
+    result = `${userBase[0]}.${userBase.slice(1)}`;
+  }
+  return `${result}@${domain}`;
+}
+
+async function createTempMailAccount(forceOwnGmail = false) {
+  if (!forceOwnGmail) {
+    const emailnatorAcc = await generateEmailnatorAccount();
+    if (emailnatorAcc) return emailnatorAcc;
+  }
+
+  // Fallback to private Gmail IMAP with dot trick (100% fresh, delivers to user inbox)
+  if (IMAP_CONFIG.auth.user) {
+    const userBase = (IMAP_CONFIG.auth.user || '').replace(/@gmail\.com$/i, '');
+    const privateEmail = generateDotGmail(userBase);
+    console.log(`[*] Using private Gmail IMAP with dot trick: ${privateEmail}`);
+    return {
+      provider: 'gmail_imap',
+      address: privateEmail,
+      createdAt: new Date(Date.now() - 60000)
+    };
+  }
 
   console.log(`[*] Emailnator unavailable, attempting SimpleLogin fallback...`);
   await cleanupOldSimpleLoginAliases();
@@ -380,10 +418,9 @@ async function createTempMailAccount() {
     }
   }
 
-  // Final fallback to Gmail IMAP alias
   const userBase = (IMAP_CONFIG.auth.user || '').replace(/@gmail\.com$/i, '');
   const gmailAlias = `${userBase}+tv${randInt(10000, 99999)}@gmail.com`;
-  console.log(`[*] Using Gmail alias fallback: ${gmailAlias}`);
+  console.log(`[*] Using Gmail plus alias fallback: ${gmailAlias}`);
   return {
     provider: 'gmail_imap',
     address: gmailAlias,
@@ -511,11 +548,13 @@ async function doRegistration() {
   console.log(`[${timestamp}] starting registration...`);
 
   let mailAccount = null;
+  let forceOwnGmail = false;
+  let consecutiveUsed = 0;
 
   for (let regAttempt = 1; regAttempt <= 8; regAttempt++) {
     try {
       console.log(`\n[*] Registration cycle attempt ${regAttempt}/8...`);
-      mailAccount = await createTempMailAccount();
+      mailAccount = await createTempMailAccount(forceOwnGmail);
       let email = mailAccount.address;
       const firstName = pick(FIRST_NAMES);
       const lastName = pick(LAST_NAMES);
@@ -570,6 +609,14 @@ async function doRegistration() {
         if (sendRes.status === 429 || sendData.code === 'limit') {
           console.log(`[-] iptvload ideiglenes IP limitet adott (429 / limit). Megszakítás, várakozás a feloldásra.`);
           break;
+        }
+        if (sendData.code === 'used' || (sendData.message || '').toLowerCase().includes('already requested')) {
+          knownUsedEmails.add(email);
+          consecutiveUsed++;
+          if (consecutiveUsed >= 2) {
+            console.log(`[*] Emailnator public addresses repeatedly rejected, switching to private Gmail IMAP...`);
+            forceOwnGmail = true;
+          }
         }
         if (sendData.code === 'captcha') {
           console.log(`[-] iptvload Turnstile token elutasítva, újrapróbálás új tokennel...`);
@@ -713,6 +760,11 @@ async function doRegistration() {
           console.log(`[-] submission failed: ${JSON.stringify(result).substring(0, 400)}`);
           if (submitRes.body.includes('already been used')) {
             console.log(`[-] email was previously used, retrying with fresh email...`);
+            knownUsedEmails.add(email);
+            consecutiveUsed++;
+            if (consecutiveUsed >= 2) {
+              forceOwnGmail = true;
+            }
             if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
             await sleep(3000);
             continue;
