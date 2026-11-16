@@ -1637,6 +1637,41 @@ function getRemainingTrialHours() {
   return Math.max(0, (expiresMs - Date.now()) / 3600000);
 }
 
+let registrationTimer = null;
+
+function scheduleNextRegistration() {
+  if (registrationTimer) {
+    clearTimeout(registrationTimer);
+    registrationTimer = null;
+  }
+
+  const remaining = getRemainingTrialHours();
+  console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'} (${remaining.toFixed(1)} óra van még hátra a 24-ből)`);
+
+  // A 24 órás próbaidőszakból 22 óránként indítjuk az újragenerálást (2 órával a lejárta előtt, folyamatos átmenettel)
+  const regMs = activeCreds.registeredAt ? new Date(activeCreds.registeredAt).getTime() : 0;
+  const targetTime = regMs ? regMs + REGISTER_INTERVAL_HOURS * 3600000 : Date.now();
+  const msUntilNext = targetTime - Date.now();
+
+  // Ha a fiók régebbi mint 22 óra, vagy kevesebb mint 2 óra van hátra, azonnali újragenerálás
+  if (msUntilNext <= 5000 || remaining < 2) {
+    const nextRun = new Date(Date.now() + 5000);
+    nextRegistrationTime = nextRun;
+    console.log(`[*] A fiók régebbi mint 22 óra (hátralévő idő: ${remaining.toFixed(1)} óra), azonnali újragenerálás indítása: ${formatBucharestTime(nextRun)} (romániai idő)`);
+    registrationTimer = setTimeout(async () => {
+      await runRegistration();
+      scheduleNextRegistration();
+    }, 5000);
+  } else {
+    nextRegistrationTime = new Date(targetTime);
+    console.log(`[*] A fiók érvényes, következő tervezett generálás pontosan 22 órával a regisztráció után: ${formatBucharestTime(nextRegistrationTime)} (romániai idő, ~${(msUntilNext / 3600000).toFixed(1)} óra múlva)`);
+    registrationTimer = setTimeout(async () => {
+      await runRegistration();
+      scheduleNextRegistration();
+    }, msUntilNext);
+  }
+}
+
 app.listen(PORT, async () => {
   console.log(`[*] server running on port ${PORT}`);
   await syncLatestCredsFromInbox();
@@ -1645,17 +1680,15 @@ app.listen(PORT, async () => {
   refreshM3uCache();
   setInterval(() => { refreshM3uCache(true); }, 4 * 3600000);
 
-  const remaining = getRemainingTrialHours();
-  console.log(`[*] JELENLEG BETÖLTÖTT FIÓK: ${activeCreds.username || 'nincs'} (${remaining.toFixed(1)} óra van még hátra)`);
-  if (remaining < 2) {
-    const initialNext = new Date(Date.now() + 5000);
-    nextRegistrationTime = initialNext;
-    console.log(`[*] a fiók lejárt vagy 2 órán belül lejár, azonnali új fiók regisztráció indítása: ${formatBucharestTime(initialNext)} (romániai idő)`);
-    setTimeout(() => { runRegistration(); }, 5000);
-  } else {
-    const nextRun = new Date(Date.now() + Math.min(REGISTER_INTERVAL_HOURS, Math.max(1, remaining - 1)) * 3600000);
-    nextRegistrationTime = nextRun;
-    console.log(`[*] a betöltött fiók érvényes, következő tervezett generálás: ${formatBucharestTime(nextRun)} (romániai idő)`);
-  }
-  setInterval(() => { runRegistration(); }, REGISTER_INTERVAL_HOURS * 3600000);
+  // Ütemezés pontosan a 22 órás ciklusra
+  scheduleNextRegistration();
+
+  // Watchdog ellenőrzés 15 percenként: ha a hátralévő idő 2 óra alá esne és még nem indult el, beindítja
+  setInterval(() => {
+    const rem = getRemainingTrialHours();
+    if (rem < 2 && !isRegistering) {
+      console.log(`[*] Watchdog: Hátralévő idő < 2 óra (${rem.toFixed(1)} óra), újragenerálás indítása...`);
+      runRegistration().then(() => scheduleNextRegistration());
+    }
+  }, 15 * 60 * 1000);
 });
