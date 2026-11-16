@@ -349,6 +349,22 @@ async function readEmailnatorMessage(msgId) {
   return { from: '', subject: '', body: '' };
 }
 
+async function deleteEmailnatorMessage(msgId) {
+  if (!msgId) return;
+  try {
+    await httpRequest(`https://www.emailnator.com/api/delete-message/${encodeURIComponent(msgId)}`, {
+      method: 'DELETE',
+      headers: {
+        'Origin': 'https://www.emailnator.com',
+        'Referer': 'https://www.emailnator.com/'
+      }
+    });
+    console.log(`[+] Emailnator üzenet sikeresen törölve a postaládából (${msgId.substring(0, 15)}...)`);
+  } catch (err) {
+    console.log(`[-] Emailnator üzenet törlési figyelmeztetés: ${err.message}`);
+  }
+}
+
 async function createTempMailAccount() {
   const emailnatorAcc = await generateEmailnatorAccount();
   if (emailnatorAcc) return emailnatorAcc;
@@ -557,6 +573,7 @@ async function doRegistration() {
         console.log(`[+] verification code sent to ${email}!`);
 
         let verificationCode = null;
+        let verificationMsgId = null;
         const maxWaitMs = 90000;
         const pollIntervalMs = 6000;
         const startTime = Date.now();
@@ -575,6 +592,7 @@ async function doRegistration() {
               const subjectMatch = subject.match(/\b(\d{6})\b/);
               if (subjectMatch) {
                 verificationCode = subjectMatch[1];
+                verificationMsgId = msg.id;
                 console.log(`[+] VERIFICATION CODE FROM SUBJECT: ${verificationCode}`);
                 break;
               }
@@ -585,6 +603,7 @@ async function doRegistration() {
               const codeMatch = bodyText.match(/\b(\d{6})\b/);
               if (codeMatch) {
                 verificationCode = codeMatch[1];
+                verificationMsgId = msg.id;
                 console.log(`[+] VERIFICATION CODE FOUND IN BODY: ${verificationCode}`);
                 break;
               }
@@ -598,7 +617,6 @@ async function doRegistration() {
 
         if (!verificationCode) {
           console.error(`[-] could not retrieve verification code within ${maxWaitMs / 1000}s, retrying with fresh email...`);
-          if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
           continue;
         }
 
@@ -619,12 +637,16 @@ async function doRegistration() {
 
         if (!verifyData.ok || !verifyData.token) {
           console.error(`[-] verification failed: ${verifyData.message || verifyData.code}, retrying...`);
-          if (mailAccount.provider === 'simplelogin') await deleteTempMailAccount(mailAccount);
           continue;
         }
 
         ivlToken = verifyData.token;
         console.log(`[+] email verified! ivl_token: ${ivlToken.substring(0, 20)}...`);
+
+        // Sikeres hitelesítés után azonnal kitöröljük az ellenőrző levelet az Emailnator postaládájából
+        if (verificationMsgId) {
+          await deleteEmailnatorMessage(verificationMsgId);
+        }
       }
 
       console.log(`[*] fetching registration page for tokens...`);
